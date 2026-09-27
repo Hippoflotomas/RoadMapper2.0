@@ -1,12 +1,15 @@
-﻿using System;
+﻿using Jotunn.Managers;
+using System;
+using System.Collections.Generic;
 using UnityEngine;
+using UnityEngine.Rendering;
 
 namespace RoadMapper
 {
     // The in-world stand-in for a map marker: a banner hanging off a 4 m log pole, with the
     // marker's icon on it. Built once per marker (the first time one is shown), kept as an
     // inactive template, and cloned for each marker near the player. Local only, like the road
-    // flags: no network object, nothing saved, gone when the Roadmapper is put away.
+    // flags: no network object, nothing saved, gone when the Surveyor is put away.
     //
     // The banner image trick comes from BannerShare: vanilla banner UVs don't cover the whole
     // cloth, so the cloth mesh gets fresh UVs projected flat across its z/y bounds, and then any
@@ -27,19 +30,28 @@ namespace RoadMapper
 
         private static bool _missingLogged;
 
-        // Returns null if anything needed is missing; the caller falls back to the wisp torch.
-        public static GameObject Build(MarkerIcon icon, Transform inactiveParent)
+        // Vanilla prefab by name: from the live scene in game, or Jotunn's cache at the main menu
+        // (where the Surveyor's model is built, before any ZNetScene exists).
+        internal static GameObject FindPrefab(string name)
         {
-            ZNetScene scene = ZNetScene.instance;
-            GameObject polePrefab = scene != null ? scene.GetPrefab(PolePrefabName) : null;
-            GameObject bannerPrefab = scene != null ? scene.GetPrefab(BannerPrefabName) : null;
+            GameObject prefab = ZNetScene.instance != null ? ZNetScene.instance.GetPrefab(name) : null;
+            return prefab != null ? prefab : PrefabManager.Cache.GetPrefab<GameObject>(name);
+        }
+
+        // Returns null if anything needed is missing; the caller falls back to the wisp torch.
+        // icon null = a plain banner (used for the Surveyor's own model).
+        // still = no wind sway on the cloth (the Surveyor's banner: a flapping flag in the hand looks wrong).
+        public static GameObject Build(MarkerIcon icon, Transform inactiveParent, bool still = false)
+        {
+            GameObject polePrefab = FindPrefab(PolePrefabName);
+            GameObject bannerPrefab = FindPrefab(BannerPrefabName);
             if (polePrefab == null || bannerPrefab == null)
             {
                 WarnOnce($"'{PolePrefabName}' or '{BannerPrefabName}' not found");
                 return null;
             }
 
-            GameObject root = new GameObject($"RoadMapper_MarkerBanner_{icon.Id}");
+            GameObject root = new GameObject($"RoadMapper_MarkerBanner_{(icon != null ? icon.Id.ToString() : "Plain")}");
             root.transform.SetParent(inactiveParent, false);
 
             // --- Pole: stripped to its meshes, standing on the ground, centred on the point.
@@ -95,6 +107,8 @@ namespace RoadMapper
             Color32 background = AverageColour(cloth.sharedMaterial.GetTexture("_MainTex"), ClothColour);
             Material material = new Material(cloth.sharedMaterial);
             material.SetTexture("_MainTex", BuildBannerTexture(icon, original.bounds.size.z, original.bounds.size.y, background));
+            if (still)
+                FreezeWind(material);
             cloth.sharedMaterial = material;
 
             // --- Hang it off the side of the pole like a flag: top (the bar) just under the pole top,
@@ -156,14 +170,27 @@ namespace RoadMapper
             int w = CanvasWidth;
             int h = Mathf.Clamp(Mathf.RoundToInt(w * heightMetres / Mathf.Max(widthMetres, 0.01f)), 16, 256);
 
+            Color32[] pixels = new Color32[w * h];
+            for (int i = 0; i < pixels.Length; i++)
+                pixels[i] = background;
+
+            Texture2D tex = new Texture2D(w, h, TextureFormat.RGBA32, false)
+            {
+                name = $"RoadMapper_MarkerBanner_{(icon != null ? icon.Id.ToString() : "Plain")}",
+                filterMode = FilterMode.Point,
+                wrapMode = TextureWrapMode.Clamp
+            };
+            if (icon == null)
+            {
+                tex.SetPixels32(pixels);
+                tex.Apply(false);
+                return tex;
+            }
+
             int scale = Math.Max(1, Math.Min((int)(w * 0.75f) / icon.Width, (int)(h * 0.6f) / icon.Height));
             int iw = icon.Width * scale, ih = icon.Height * scale;
             int left = (w - iw) / 2;
             int bottom = Mathf.Clamp((h - ih) / 2 + h / 10, 0, Math.Max(0, h - ih));
-
-            Color32[] pixels = new Color32[w * h];
-            for (int i = 0; i < pixels.Length; i++)
-                pixels[i] = background;
 
             for (int y = 0; y < ih; y++)
             {
@@ -186,15 +213,41 @@ namespace RoadMapper
                 }
             }
 
-            Texture2D tex = new Texture2D(w, h, TextureFormat.RGBA32, false)
-            {
-                name = $"RoadMapper_MarkerBanner_{icon.Id}",
-                filterMode = FilterMode.Point,
-                wrapMode = TextureWrapMode.Clamp
-            };
             tex.SetPixels32(pixels);
             tex.Apply(false);
             return tex;
+        }
+
+        // The cloth's sway is done in its shader (Custom/Vegetation), not by a component, so stripping
+        // components doesn't stop it. Zero every float/range property that looks like a wind
+        // control. The names aren't documented, so this logs what it zeroed, or, if it found
+        // nothing, the shader's full property list so the right one can be picked out.
+        private static void FreezeWind(Material material)
+        {
+            Shader shader = material.shader;
+            List<string> zeroed = new List<string>();
+            List<string> all = new List<string>();
+            int count = shader.GetPropertyCount();
+            for (int i = 0; i < count; i++)
+            {
+                string name = shader.GetPropertyName(i);
+                ShaderPropertyType type = shader.GetPropertyType(i);
+                all.Add($"{name} ({type})");
+                if (type != ShaderPropertyType.Float && type != ShaderPropertyType.Range)
+                    continue;
+                string lower = name.ToLowerInvariant();
+                if (lower.Contains("wind") || lower.Contains("sway") || lower.Contains("bend")
+                    || lower.Contains("wave") || lower.Contains("flutter") || lower.Contains("wobble"))
+                {
+                    material.SetFloat(name, 0f);
+                    zeroed.Add(name);
+                }
+            }
+
+            if (zeroed.Count > 0)
+                Jotunn.Logger.LogInfo($"[RoadMapper] Surveyor banner: wind switched off ({string.Join(", ", zeroed)}).");
+            else
+                Jotunn.Logger.LogWarning($"[RoadMapper] Surveyor banner: no wind setting found on '{shader.name}'. Its properties: {string.Join(", ", all)}");
         }
 
         // Alpha-weighted average colour of any texture, readable or not (blitted down small and
@@ -230,7 +283,7 @@ namespace RoadMapper
 
         // Bounds of the (enabled) meshes under go, in the given transform's space. Worked out from
         // the meshes rather than Renderer.bounds, which isn't reliable on inactive objects.
-        private static bool TryGetBounds(GameObject go, Transform space, Renderer only, out Bounds bounds)
+        internal static bool TryGetBounds(GameObject go, Transform space, Renderer only, out Bounds bounds)
         {
             bounds = default;
             bool any = false;

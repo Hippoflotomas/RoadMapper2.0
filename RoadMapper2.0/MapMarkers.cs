@@ -60,7 +60,12 @@ namespace RoadMapper
             Directory.CreateDirectory(folder);
 
             string[] files = Directory.GetFiles(folder, "*.png");
-            Array.Sort(files, StringComparer.OrdinalIgnoreCase);
+            // Numeric order, so the build menu follows the ids (plain text order puts "104" before "51").
+            Array.Sort(files, (a, b) =>
+            {
+                int ia = LeadingNumber(Path.GetFileName(a)), ib = LeadingNumber(Path.GetFileName(b));
+                return ia != ib ? ia.CompareTo(ib) : StringComparer.OrdinalIgnoreCase.Compare(a, b);
+            });
 
             foreach (string path in files)
             {
@@ -153,6 +158,14 @@ namespace RoadMapper
                 Rgba = rgba,
                 Sprite = sprite
             };
+        }
+
+        private static int LeadingNumber(string fileName)
+        {
+            int n = 0, i = 0;
+            while (i < fileName.Length && char.IsDigit(fileName[i]) && n < 100000000)
+                n = n * 10 + (fileName[i++] - '0');
+            return i == 0 ? int.MaxValue : n; // no number: sorts last (and gets skipped by the scan anyway)
         }
 
         // "camp_site" -> "Camp Site"

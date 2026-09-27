@@ -226,7 +226,7 @@ namespace RoadMapper
 
             // Client-side, not synced: each player decides for themselves.
             _showFlags = Config.Bind("Flags", "Show flags", true,
-                "While you hold the Roadmapper, show a small flag, tinted to the brush colour, on every recorded road point around you. Flags are only visible to you and vanish when you put the Roadmapper away.");
+                "While you hold the Surveyor, show a small flag, tinted to the brush colour, on every recorded road point around you. Flags are only visible to you and vanish when you put the Surveyor away.");
             _maxFlags = Config.Bind("Flags", "Max flags", 1000,
                 "Most flags shown at once; the ones furthest from you are dropped first.");
             _showMarkerPins = Config.Bind("Pins", "Show marker pins", true,
@@ -649,24 +649,27 @@ namespace RoadMapper
 
             ItemConfig toolConfig = new ItemConfig
             {
-                Name = "Roadmapper",
+                // Display name only. The prefab stays RoadMapper_Tool so tools already crafted carry over.
+                Name = "Surveyor",
                 Description = "Marks roads, walls and places onto the printed map. Does not affect terrain.",
                 PieceTable = PieceTableName,
                 CraftingStation = CraftingStations.Workbench
-                // TODO(model): Icons = new[] { LoadIcon("Icons/ToolIcon.png") } once there's a tool icon.
-                //              Until then it shows the hammer's inventory icon.
             };
+
+            // Inventory icon (Icons/ToolIcon.png next to the DLL): the wax-sealed scroll.
+            // If the file's missing, the hammer's icon stays.
+            Sprite toolIcon = LoadIcon("Icons/ToolIcon.png");
+            if (toolIcon != null)
+                toolConfig.Icons = new[] { toolIcon };
             // Same recipe as the vanilla hoe for now.
             toolConfig.AddRequirement("Wood", 5, 0);
             toolConfig.AddRequirement("Stone", 2, 0);
 
-            // TODO(model): cloned from the vanilla Hammer, so it looks and is held exactly like a hammer.
-            // (Was the Hoe until 2.1; the prefab name is unchanged, so existing tools carry over.)
-            // When there's a proper model, load it from an asset bundle instead, e.g.
-            //   AssetBundle bundle = AssetUtils.LoadAssetBundleFromResources("roadmapper");
-            //   new CustomItem(bundle, "RoadMapper_Tool", fixReference: true, toolConfig);
-            // or, as a cheaper step, keep the hammer mesh and retint its material here.
+            // Cloned from the vanilla Hammer for how it's held and used (was the Hoe until 2.1; the
+            // prefab name is unchanged, so existing tools carry over). The hammer's mesh is then
+            // swapped for a kitbashed bundle of a tiny marker banner and a tiny wisp torch.
             CustomItem tool = new CustomItem(ToolPrefabName, "Hammer", toolConfig);
+            SurveyorModel.Apply(tool.ItemPrefab);
 
             // Marking the map shouldn't wear you out or wear the tool out.
             ItemDrop.ItemData.SharedData shared = tool.ItemDrop.m_itemData.m_shared;
@@ -729,7 +732,7 @@ namespace RoadMapper
         private static bool IsServer => ZNet.instance != null && ZNet.instance.IsServer();
 
         // Valheim announces every newly known build piece top-left ("New piece: ..."). With a
-        // marker per icon that's dozens of messages the first time you pick up the Roadmapper, so
+        // marker per icon that's dozens of messages the first time you pick up the Surveyor, so
         // marker pieces are learned silently: same bookkeeping as the vanilla method (the piece
         // goes into m_knownRecipes), just without the message.
         [HarmonyPatch(typeof(Player), "AddKnownPiece")]
@@ -795,7 +798,7 @@ namespace RoadMapper
         //
         // A small tinted flag goes down wherever the local player strikes with a road tool, so
         // you can see what you've marked. They are plain GameObjects (no ZNetView): nobody else
-        // sees them, nothing is saved, and they all go when the Roadmapper leaves your hand.
+        // sees them, nothing is saved, and they all go when the Surveyor leaves your hand.
         //
         // The flag is the Mistlands wisp torch at half scale, tinted to the brush colour, glowing
         // ball and all (the ball is what makes the colour readable; the wood torch's flame was
@@ -1076,7 +1079,7 @@ namespace RoadMapper
             return template;
         }
 
-        private static GameObject BuildFlagTemplate(GameObject source, Color colour, int brushId, float scale, Transform inactiveParent)
+        internal static GameObject BuildFlagTemplate(GameObject source, Color colour, int brushId, float scale, Transform inactiveParent)
         {
             // Instantiated under an inactive parent, so no Awake/Start runs on any of the torch's
             // scripts (ZNetView, Fireplace, WearNTear...) and it's safe to rip them out.
