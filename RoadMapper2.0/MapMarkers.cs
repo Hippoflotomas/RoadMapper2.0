@@ -139,6 +139,9 @@ namespace RoadMapper
             tex.filterMode = FilterMode.Point;
             tex.wrapMode = TextureWrapMode.Clamp;
             Sprite sprite = Sprite.Create(tex, new Rect(0, 0, w, h), new Vector2(0.5f, 0.5f));
+            // Unique names: mods that cache map pin icons (NomapPrinter does) key them by sprite name.
+            sprite.name = $"RoadMapper_{id}";
+            tex.name = sprite.name;
 
             return new MarkerIcon
             {

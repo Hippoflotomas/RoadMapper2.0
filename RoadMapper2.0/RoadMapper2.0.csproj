@@ -81,6 +81,10 @@
 		  <HintPath>$(VALHEIM_MANAGED)\UnityEngine.ParticleSystemModule.dll</HintPath>
 		  <Private>false</Private>
 	  </Reference>
+	  <Reference Include="Splatform">
+		  <HintPath>$(VALHEIM_MANAGED)\Splatform.dll</HintPath>
+		  <Private>false</Private>
+	  </Reference>
   </ItemGroup>
 
   <ItemGroup>

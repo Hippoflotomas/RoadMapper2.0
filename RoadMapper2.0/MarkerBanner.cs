@@ -15,12 +15,13 @@ namespace RoadMapper
     internal static class MarkerBanner
     {
         public const string PolePrefabName = "wood_pole_log_4";   // Log Pole 4 m
-        public const string BannerPrefabName = "piece_banner01";
+        public const string BannerPrefabName = "piece_banner09";   // the purple one
         private const string ClothShaderName = "Custom/Vegetation";
 
         private const float TopMargin = 0.15f;                     // gap between pole top and banner top (before scaling)
         private const float BannerScale = 0.5f;                    // whole thing, pole and banner: half size
         private const float PoleGirth = 0.5f;                      // pole thickness only (x/z), applied before layout
+        // Fallback banner background if the banner's own colour can't be read.
         private static readonly Color32 ClothColour = new Color32(222, 208, 176, 255); // plain linen
         private const int CanvasWidth = 64;                        // banner texture width in pixels
 
@@ -61,7 +62,7 @@ namespace RoadMapper
             pole.transform.localPosition = poleShift;
             poleBounds.center += poleShift;
 
-            // --- Banner: just the cloth (the hanging bar and anything else is hidden).
+            // --- Banner: the cloth plus its wooden hanging bar.
             GameObject banner = UnityEngine.Object.Instantiate(bannerPrefab, root.transform, false);
             banner.name = "Banner";
             banner.transform.localPosition = Vector3.zero;
@@ -72,10 +73,11 @@ namespace RoadMapper
             foreach (MeshRenderer r in banner.GetComponentsInChildren<MeshRenderer>(true))
             {
                 Material m = r.sharedMaterial;
-                if (cloth == null && m != null && m.shader != null && m.shader.name == ClothShaderName)
+                if (m != null && m.shader != null && m.shader.name == ClothShaderName)
+                {
                     cloth = r;
-                else
-                    r.enabled = false;
+                    break;
+                }
             }
             MeshFilter filter = cloth != null ? cloth.GetComponent<MeshFilter>() : null;
             if (filter == null || filter.sharedMesh == null)
@@ -88,25 +90,30 @@ namespace RoadMapper
             Mesh original = filter.sharedMesh;
             filter.sharedMesh = WithFlatUVs(original);
 
+            // Background is the banner's own colour (averaged from its texture), so the purple
+            // banner stays purple with the icon on it.
+            Color32 background = AverageColour(cloth.sharedMaterial.GetTexture("_MainTex"), ClothColour);
             Material material = new Material(cloth.sharedMaterial);
-            material.SetTexture("_MainTex", BuildBannerTexture(icon, original.bounds.size.z, original.bounds.size.y));
+            material.SetTexture("_MainTex", BuildBannerTexture(icon, original.bounds.size.z, original.bounds.size.y, background));
             cloth.sharedMaterial = material;
 
-            // --- Hang it off the side of the pole like a flag: top edge just under the pole top,
-            // inner edge against the pole. The cloth is thin in one horizontal direction and wide
-            // in the other; the wide one is whichever sticks out from the pole.
-            if (TryGetBounds(banner, root.transform, cloth, out Bounds clothBounds))
+            // --- Hang it off the side of the pole like a flag: top (the bar) just under the pole top,
+            // inner end against the pole. The cloth decides which way is "out": it's thin in one
+            // horizontal direction and wide in the other. The whole banner, bar included, is what
+            // gets lined up, so the bar end is what meets the pole.
+            if (TryGetBounds(banner, root.transform, cloth, out Bounds clothBounds)
+                && TryGetBounds(banner, root.transform, null, out Bounds bannerBounds))
             {
                 Vector3 shift = Vector3.zero;
-                shift.y = (poleBounds.max.y - TopMargin) - clothBounds.max.y;
+                shift.y = (poleBounds.max.y - TopMargin) - bannerBounds.max.y;
                 if (clothBounds.size.z >= clothBounds.size.x)
                 {
-                    shift.z = poleBounds.max.z - clothBounds.min.z;
+                    shift.z = poleBounds.max.z - bannerBounds.min.z;
                     shift.x = -clothBounds.center.x;
                 }
                 else
                 {
-                    shift.x = poleBounds.max.x - clothBounds.min.x;
+                    shift.x = poleBounds.max.x - bannerBounds.min.x;
                     shift.z = -clothBounds.center.z;
                 }
                 banner.transform.localPosition += shift;
@@ -144,7 +151,7 @@ namespace RoadMapper
         // Plain cloth with the icon blown up (whole-pixel steps, so pixel art stays crisp) in the
         // middle, a little above centre. The texture has the banner's own proportions so the
         // icon isn't stretched.
-        private static Texture2D BuildBannerTexture(MarkerIcon icon, float widthMetres, float heightMetres)
+        private static Texture2D BuildBannerTexture(MarkerIcon icon, float widthMetres, float heightMetres, Color32 background)
         {
             int w = CanvasWidth;
             int h = Mathf.Clamp(Mathf.RoundToInt(w * heightMetres / Mathf.Max(widthMetres, 0.01f)), 16, 256);
@@ -156,7 +163,7 @@ namespace RoadMapper
 
             Color32[] pixels = new Color32[w * h];
             for (int i = 0; i < pixels.Length; i++)
-                pixels[i] = ClothColour;
+                pixels[i] = background;
 
             for (int y = 0; y < ih; y++)
             {
@@ -188,6 +195,37 @@ namespace RoadMapper
             tex.SetPixels32(pixels);
             tex.Apply(false);
             return tex;
+        }
+
+        // Alpha-weighted average colour of any texture, readable or not (blitted down small and
+        // read back). Returns the fallback if there's no texture or nothing opaque in it.
+        private static Color32 AverageColour(Texture source, Color32 fallback)
+        {
+            if (source == null) return fallback;
+
+            const int size = 32;
+            RenderTexture rt = RenderTexture.GetTemporary(size, size, 0, RenderTextureFormat.ARGB32, RenderTextureReadWrite.sRGB);
+            RenderTexture previous = RenderTexture.active;
+            Graphics.Blit(source, rt);
+            RenderTexture.active = rt;
+            Texture2D small = new Texture2D(size, size, TextureFormat.RGBA32, false);
+            small.ReadPixels(new Rect(0, 0, size, size), 0, 0);
+            RenderTexture.active = previous;
+            RenderTexture.ReleaseTemporary(rt);
+
+            Color32[] pixels = small.GetPixels32();
+            UnityEngine.Object.Destroy(small);
+
+            long r = 0, g = 0, b = 0, weight = 0;
+            foreach (Color32 c in pixels)
+            {
+                r += c.r * c.a;
+                g += c.g * c.a;
+                b += c.b * c.a;
+                weight += c.a;
+            }
+            if (weight == 0) return fallback;
+            return new Color32((byte)(r / weight), (byte)(g / weight), (byte)(b / weight), 255);
         }
 
         // Bounds of the (enabled) meshes under go, in the given transform's space. Worked out from

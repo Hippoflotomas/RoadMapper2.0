@@ -69,6 +69,7 @@ namespace RoadMapper
         public static CustomRPC EraseRPC;
         public static CustomRPC LayerFlushRPC;
         public static CustomRPC FlagPointsRPC;
+        public static CustomRPC MarkerPinsRPC;
 
         // ---------------------------------------------------------------------
         // Config
@@ -101,6 +102,9 @@ namespace RoadMapper
         private ConfigEntry<bool> _showFlags;
         private ConfigEntry<int> _maxFlags;
         private ConfigEntry<float> _flagRadius;
+
+        // Marker pins (client-side, per player)
+        private ConfigEntry<bool> _showMarkerPins;
 
         private Harmony _harmony;
 
@@ -151,6 +155,13 @@ namespace RoadMapper
                 "RoadMapper_FlagPointsRPC",
                 ServerReceiveFlagPointsRequest,
                 ClientReceiveFlagPoints);
+
+            // Client asks for every map marker on joining; server answers, and re-sends to
+            // everyone whenever a marker is placed or erased.
+            MarkerPinsRPC = NetworkManager.Instance.AddRPC(
+                "RoadMapper_MarkerPinsRPC",
+                ServerReceiveMarkerPinsRequest,
+                ClientReceiveMarkerPins);
 
             _harmony = new Harmony(PluginGUID);
             _harmony.PatchAll();
@@ -218,6 +229,13 @@ namespace RoadMapper
                 "While you hold the Roadmapper, show a small flag, tinted to the brush colour, on every recorded road point around you. Flags are only visible to you and vanish when you put the Roadmapper away.");
             _maxFlags = Config.Bind("Flags", "Max flags", 1000,
                 "Most flags shown at once; the ones furthest from you are dropped first.");
+            _showMarkerPins = Config.Bind("Pins", "Show marker pins", true,
+                "Add every map marker as a vanilla map pin (never saved), so mods that read map pins, such as compasses, show them too.");
+            _showMarkerPins.SettingChanged += (_, __) =>
+            {
+                if (_showMarkerPins.Value) _markerPinsRequested = false; // re-fetch on next Update
+                else RemoveMarkerPins();
+            };
             _flagRadius = Config.Bind("Flags", "Radius", 100f,
                 $"Show flags for recorded points within this many metres of you (the server caps it at {MaxFlagRadius:0} m).");
         }
@@ -264,6 +282,7 @@ namespace RoadMapper
             if (_awaitingLayerUntil > 0f)
                 CheckForRefreshedLayer();
             UpdateFlags();
+            UpdateMarkerPins();
 
             bool serverWorldUp = IsServer && !string.IsNullOrEmpty(ZNet.instance.GetWorldName());
 
@@ -1353,6 +1372,137 @@ namespace RoadMapper
             return near;
         }
 
+        // ---------------------------------------------------------------------
+        // Marker pins
+        //
+        // Every map marker also becomes a vanilla map pin on each client, with the marker's own
+        // icon and name. Nomap hides the map itself, but the pins are still there for anything
+        // that reads them, e.g. compass mods. Pins are added with save: false, so they never
+        // reach anyone's character file; they're rebuilt from the server's point file on join
+        // and whenever a marker is placed or erased.
+        //
+        // NomapPrinter won't print them: it only prints pins whose icon it knows by name.
+        // ---------------------------------------------------------------------
+
+        // Icon3 is the plain "pin" type. Some compass mods filter by pin type; if yours hides
+        // these, this is the line to change.
+        private const Minimap.PinType MarkerPinType = Minimap.PinType.Icon3;
+
+        private readonly List<Minimap.PinData> _markerPins = new List<Minimap.PinData>();
+        private bool _markerPinsRequested;
+
+        private void UpdateMarkerPins()
+        {
+            // Minimap goes with the game scene (logout); its pins go with it.
+            if (Minimap.instance == null)
+            {
+                _markerPinsRequested = false;
+                _markerPins.Clear();
+                return;
+            }
+            // Wait for a player, and don't re-ask on respawn: Minimap (and our pins) survive death.
+            if (Player.m_localPlayer == null || _markerPinsRequested || !_showMarkerPins.Value)
+                return;
+
+            _markerPinsRequested = true;
+            if (IsServer)
+            {
+                ApplyMarkerPins(FindAllMarkerPoints());
+                return;
+            }
+            ZNetPeer server = ZNet.instance != null ? ZNet.instance.GetServerPeer() : null;
+            if (server != null)
+                MarkerPinsRPC.SendPackage(server.m_uid, new ZPackage());
+            else
+                _markerPinsRequested = false; // not connected yet; try again next frame
+        }
+
+        private void ApplyMarkerPins(List<MarkerPoint> points)
+        {
+            RemoveMarkerPins();
+            if (!_showMarkerPins.Value || Minimap.instance == null)
+                return;
+
+            foreach (MarkerPoint p in points)
+            {
+                // Markers this client has no icon for are skipped.
+                if (!MapMarkers.ById.TryGetValue(p.BrushId, out MarkerIcon icon))
+                    continue;
+
+                Vector3 pos = new Vector3(p.x, GroundHeightAt(p.x, p.z), p.z);
+                Minimap.PinData pin = Minimap.instance.AddPin(pos, MarkerPinType, icon.Name, false, false);
+                if (pin == null) continue;
+                pin.m_icon = icon.Sprite;
+                _markerPins.Add(pin);
+            }
+        }
+
+        private void RemoveMarkerPins()
+        {
+            if (Minimap.instance != null)
+            {
+                foreach (Minimap.PinData pin in _markerPins)
+                    Minimap.instance.RemovePin(pin);
+            }
+            _markerPins.Clear();
+        }
+
+        // Server: every marker point in the world (any id from 50 up; each client decides which it can show).
+        private List<MarkerPoint> FindAllMarkerPoints()
+        {
+            List<MarkerPoint> markers = new List<MarkerPoint>();
+            if (ZNet.instance == null || string.IsNullOrEmpty(ZNet.instance.GetWorldName()))
+                return markers;
+            foreach (MarkerPoint p in LoadPointsFromFile(GetWorldDataFilePath()))
+                if (p.BrushId >= MapMarkers.FirstMarkerId) markers.Add(p);
+            return markers;
+        }
+
+        private static ZPackage PackPoints(List<MarkerPoint> points)
+        {
+            ZPackage package = new ZPackage();
+            package.Write(points.Count);
+            foreach (MarkerPoint p in points)
+            {
+                package.Write(p.x);
+                package.Write(p.z);
+                package.Write(p.BrushId);
+            }
+            return package;
+        }
+
+        private static List<MarkerPoint> UnpackPoints(ZPackage package)
+        {
+            int count = package.ReadInt();
+            List<MarkerPoint> points = new List<MarkerPoint>(count);
+            for (int i = 0; i < count; i++)
+                points.Add(new MarkerPoint { x = package.ReadSingle(), z = package.ReadSingle(), BrushId = package.ReadInt() });
+            return points;
+        }
+
+        // Server: a marker was placed or erased, so everyone gets the new list.
+        private void BroadcastMarkerPins()
+        {
+            if (!IsServer) return;
+            List<MarkerPoint> markers = FindAllMarkerPoints();
+            foreach (ZNetPeer peer in ZNet.instance.GetPeers())
+                MarkerPinsRPC.SendPackage(peer.m_uid, PackPoints(markers)); // fresh package per peer
+            if (Player.m_localPlayer != null)
+                ApplyMarkerPins(markers); // host / single player
+        }
+
+        private IEnumerator ServerReceiveMarkerPinsRequest(long sender, ZPackage package)
+        {
+            MarkerPinsRPC.SendPackage(sender, PackPoints(FindAllMarkerPoints()));
+            yield break;
+        }
+
+        private IEnumerator ClientReceiveMarkerPins(long sender, ZPackage package)
+        {
+            ApplyMarkerPins(UnpackPoints(package));
+            yield break;
+        }
+
         private IEnumerator ClientReceiveNothing(long sender, ZPackage package)
         {
             yield break;
@@ -1421,6 +1571,8 @@ namespace RoadMapper
                 File.AppendAllText(path, line);
                 Jotunn.Logger.LogDebug($"[RoadMapper] Wrote point to {path}");
                 OnLayerStrike();
+                if (brushId >= MapMarkers.FirstMarkerId)
+                    BroadcastMarkerPins();
             }
             catch (Exception ex)
             {
@@ -1436,11 +1588,13 @@ namespace RoadMapper
 
             List<MarkerPoint> kept = new List<MarkerPoint>();
             int removedCount = 0;
+            bool removedMarker = false;
             foreach (MarkerPoint point in loaded)
             {
                 if (Distance(point, erasePos) <= _eraserSize.Value)
                 {
                     removedCount++;
+                    removedMarker |= point.BrushId >= MapMarkers.FirstMarkerId;
                     continue;
                 }
                 kept.Add(point);
@@ -1455,6 +1609,8 @@ namespace RoadMapper
             WritePointsToFile(path, kept);
             Jotunn.Logger.LogInfo($"[RoadMapper] Eraser removed {removedCount} marker(s) near ({x:F1}, {z:F1}).");
             OnLayerStrike();
+            if (removedMarker)
+                BroadcastMarkerPins();
         }
 
         private void OnWorldSaveFinished()
