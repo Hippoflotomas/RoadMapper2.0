@@ -37,6 +37,12 @@ namespace RoadMapper
         // size). This stops one oversized PNG painting over half a biome.
         public const int MaxIconSize = 64;
 
+        // The set that ships with the mod: <plugin folder>/Markers, next to the DLL.
+        public static string BundledFolder =>
+            Path.Combine(Path.GetDirectoryName(typeof(MapMarkers).Assembly.Location) ?? "", "Markers");
+
+        // Optional extras / replacements: BepInEx/config/RoadMapper/Markers. A file here with the same
+        // id as a bundled one replaces it; new ids add to the set.
         public static string Folder => Path.Combine(Paths.ConfigPath, "RoadMapper", "Markers");
 
         private static readonly Dictionary<int, MarkerIcon> _byId = new Dictionary<int, MarkerIcon>();
@@ -51,22 +57,46 @@ namespace RoadMapper
         private static readonly Regex FileNamePattern = new Regex(@"^(\d+)_(.+)\.png$", RegexOptions.IgnoreCase);
 
         // Main thread only (Texture2D). Safe to call more than once; later calls rescan from scratch.
+        // Every client and the server must end up with the same set: the mod's version check covers
+        // the bundled set; anything added in the config folder has to be copied to everyone by hand.
         public static void Scan()
         {
+            Dictionary<int, MarkerIcon> found = new Dictionary<int, MarkerIcon>();
+
+            int bundled = ScanFolder(BundledFolder, found, replaces: false);
+            Directory.CreateDirectory(Folder);
+            int extra = ScanFolder(Folder, found, replaces: true);
+
+            // Store in id order: the build menu follows it.
             _byId.Clear();
             _idByPrefab.Clear();
+            List<int> ids = new List<int>(found.Keys);
+            ids.Sort();
+            foreach (int id in ids)
+            {
+                _byId[id] = found[id];
+                _idByPrefab[found[id].PrefabName] = id;
+            }
 
-            string folder = Folder;
-            Directory.CreateDirectory(folder);
+            Jotunn.Logger.LogInfo($"[RoadMapper] {_byId.Count} map marker(s): {bundled} bundled ({BundledFolder}), {extra} from {Folder}");
+        }
+
+        private static int ScanFolder(string folder, Dictionary<int, MarkerIcon> found, bool replaces)
+        {
+            if (!Directory.Exists(folder))
+                return 0;
 
             string[] files = Directory.GetFiles(folder, "*.png");
-            // Numeric order, so the build menu follows the ids (plain text order puts "104" before "51").
+            // Numeric order ("104" would otherwise sort before "51"); only matters for which of two
+            // same-id files in one folder wins.
             Array.Sort(files, (a, b) =>
             {
                 int ia = LeadingNumber(Path.GetFileName(a)), ib = LeadingNumber(Path.GetFileName(b));
                 return ia != ib ? ia.CompareTo(ib) : StringComparer.OrdinalIgnoreCase.Compare(a, b);
             });
 
+            HashSet<int> seenHere = new HashSet<int>();
+            int loaded = 0;
             foreach (string path in files)
             {
                 string fileName = Path.GetFileName(path);
@@ -81,20 +111,23 @@ namespace RoadMapper
                     Jotunn.Logger.LogWarning($"[RoadMapper] Marker '{fileName}' skipped: marker ids start at {FirstMarkerId} (lower ids are road brushes).");
                     continue;
                 }
-                if (_byId.TryGetValue(id, out MarkerIcon existing))
+                if (!seenHere.Add(id))
                 {
-                    Jotunn.Logger.LogWarning($"[RoadMapper] Marker '{fileName}' skipped: id {id} is already used by '{existing.FileName}'.");
+                    Jotunn.Logger.LogWarning($"[RoadMapper] Marker '{fileName}' skipped: id {id} is used twice in {folder}.");
                     continue;
                 }
+                if (found.TryGetValue(id, out MarkerIcon existing) && !replaces)
+                    continue; // can't happen for the first folder; kept for safety
 
                 MarkerIcon icon = Load(path, fileName, id, match.Groups[2].Value);
                 if (icon == null) continue;
 
-                _byId[id] = icon;
-                _idByPrefab[icon.PrefabName] = id;
+                if (existing != null)
+                    Jotunn.Logger.LogInfo($"[RoadMapper] Marker {id}: '{fileName}' replaces bundled '{existing.FileName}'.");
+                found[id] = icon;
+                loaded++;
             }
-
-            Jotunn.Logger.LogInfo($"[RoadMapper] {_byId.Count} map marker(s) loaded from {folder}");
+            return loaded;
         }
 
         private static MarkerIcon Load(string path, string fileName, int id, string rawName)

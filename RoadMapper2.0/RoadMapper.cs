@@ -34,12 +34,13 @@ namespace RoadMapper
     [BepInPlugin(PluginGUID, PluginName, PluginVersion)]
     [BepInDependency(Jotunn.Main.ModGuid)]
     [BepInDependency(NomapPrinterLink.PluginGuid)]
-    //[NetworkCompatibility(CompatibilityLevel.EveryoneMustHaveMod, VersionStrictness.Minor)]
+    // Server and every client need the same version: RPCs, pieces and the bundled markers must match.
+    [NetworkCompatibility(CompatibilityLevel.EveryoneMustHaveMod, VersionStrictness.Minor)]
     internal class RoadMapper : BaseUnityPlugin
     {
         public const string PluginGUID = "com.jotunn.RoadMapper";
         public const string PluginName = "RoadMapper";
-        public const string PluginVersion = "2.0.0";
+        public const string PluginVersion = "2.1.0";
 
         // Prefab names kept identical to 1.x so pieces already placed in a world still resolve.
         public const string PathMarkerPrefabName = "RoadMapper_PathMarker";
@@ -768,7 +769,7 @@ namespace RoadMapper
                         erasePackage.Write(pos.x);
                         erasePackage.Write(pos.z);
                         EraseRPC.SendPackage(ZRoutedRpc.Everybody, erasePackage);
-                        Jotunn.Logger.LogInfo($"[RoadMapper] Erase request sent: ({pos.x}, {pos.z})");
+                        Jotunn.Logger.LogDebug($"[RoadMapper] Erase request sent: ({pos.x}, {pos.z})");
                     }
                     return;
                 }
@@ -789,7 +790,7 @@ namespace RoadMapper
                 package.Write(pos.z);
                 package.Write(brushId);
                 PathMarkerRPC.SendPackage(ZRoutedRpc.Everybody, package);
-                Jotunn.Logger.LogInfo($"[RoadMapper] Paint coord sent: ({pos.x}, {pos.z}, {brushId})");
+                Jotunn.Logger.LogDebug($"[RoadMapper] Paint coord sent: ({pos.x}, {pos.z}, {brushId})");
             }
         }
 
@@ -1566,7 +1567,7 @@ namespace RoadMapper
 
         private void RecordMarkerPoint(float x, float z, int brushId)
         {
-            Jotunn.Logger.LogInfo($"[RoadMapper] Recording paint coord: ({x:F1}, {z:F1}, {brushId})");
+            Jotunn.Logger.LogDebug($"[RoadMapper] Recording paint coord: ({x:F1}, {z:F1}, {brushId})");
             try
             {
                 string path = GetWorldDataFilePath();

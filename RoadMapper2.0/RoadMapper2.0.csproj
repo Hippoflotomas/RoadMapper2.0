@@ -89,6 +89,7 @@
 
   <ItemGroup>
     <None Include="Icons\*.png" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="Markers\*.png" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 
   <PropertyGroup>
