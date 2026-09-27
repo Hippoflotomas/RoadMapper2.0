@@ -1,10 +1,11 @@
 ﻿{
-  "name": "JotunnModStub",
-  "description": "",
-  "version_number": "0.0.1",
+  "name": "RoadMapper",
+  "description": "A mod for marking out roads on the map.",
+  "version_number": "2.0.0",
   "website_url": "",
   "dependencies": [
     "denikson-BepInExPack_Valheim-5.4.2333",
-    "ValheimModding-Jotunn-2.26.1"
+    "ValheimModding-Jotunn-2.30.0",
+    "shudnal-NomapPrinter-1.5.6"
   ]
 }
