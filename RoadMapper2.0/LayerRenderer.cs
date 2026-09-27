@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.IO;
 using System.IO.Compression;
@@ -41,7 +41,9 @@ namespace RoadMapper
         private static byte[] _pixels;
 
         // Paints every point and returns PNG bytes. Row 0 of the PNG is north.
-        public static byte[] Render(List<RoadMapper.MarkerPoint> points, Dictionary<int, Brush> brushes, MapGeometry geo)
+        // Road strokes first, then marker icons on top, so a road never paints over a marker.
+        public static byte[] Render(List<RoadMapper.MarkerPoint> points, Dictionary<int, Brush> brushes,
+            IReadOnlyDictionary<int, MarkerIcon> icons, MapGeometry geo)
         {
             int size = geo.TextureSize;
             int byteCount = size * size * 4;
@@ -56,6 +58,15 @@ namespace RoadMapper
                 if (!brushes.TryGetValue(p.BrushId, out Brush brush))
                     continue;
                 StampDisc(_pixels, size, geo.PixelSize, p.x, p.z, brush);
+            }
+
+            if (icons != null && icons.Count > 0)
+            {
+                foreach (RoadMapper.MarkerPoint p in points)
+                {
+                    if (icons.TryGetValue(p.BrushId, out MarkerIcon icon))
+                        StampIcon(_pixels, size, geo.PixelSize, p.x, p.z, icon);
+                }
             }
 
             return PngEncoder.EncodeRgba(_pixels, size, size);
@@ -100,6 +111,53 @@ namespace RoadMapper
                 int px = (int)Math.Floor(cx), py = (int)Math.Floor(cy);
                 if (px >= 0 && px < size && py >= 0 && py < size)
                     SetPixel(pixels, size, px, py, brush);
+            }
+        }
+
+        // Icon drawn at its own size (one icon pixel = one map pixel), centred on the point, alpha
+        // blended over whatever is already there so soft or ragged edges come out clean.
+        private static void StampIcon(byte[] pixels, int size, int pixelSize, float x, float z, MarkerIcon icon)
+        {
+            float cx = x / pixelSize + size / 2f;
+            float cy = size / 2f - z / pixelSize;
+            int left = (int)Math.Round(cx - icon.Width / 2f);
+            int top = (int)Math.Round(cy - icon.Height / 2f);
+
+            for (int iy = 0; iy < icon.Height; iy++)
+            {
+                int py = top + iy;
+                if (py < 0 || py >= size) continue;
+                for (int ix = 0; ix < icon.Width; ix++)
+                {
+                    int px = left + ix;
+                    if (px < 0 || px >= size) continue;
+
+                    int s = (iy * icon.Width + ix) * 4;
+                    int srcA = icon.Rgba[s + 3];
+                    if (srcA == 0) continue;
+
+                    int d = (py * size + px) * 4;
+                    if (srcA == 255)
+                    {
+                        pixels[d] = icon.Rgba[s];
+                        pixels[d + 1] = icon.Rgba[s + 1];
+                        pixels[d + 2] = icon.Rgba[s + 2];
+                        pixels[d + 3] = 255;
+                        continue;
+                    }
+
+                    // Porter-Duff "over" with straight (non-premultiplied) alpha, in 0..255 ints.
+                    int dstA = pixels[d + 3];
+                    int outA = srcA + dstA * (255 - srcA) / 255;
+                    if (outA == 0) continue;
+                    for (int k = 0; k < 3; k++)
+                    {
+                        int src = icon.Rgba[s + k];
+                        int dst = pixels[d + k];
+                        pixels[d + k] = (byte)((src * srcA + dst * dstA * (255 - srcA) / 255) / outA);
+                    }
+                    pixels[d + 3] = (byte)outA;
+                }
             }
         }
 

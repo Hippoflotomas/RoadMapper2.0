@@ -110,6 +110,7 @@ namespace RoadMapper
             Instance = this;
 
             BindConfig();
+            MapMarkers.Scan();
 
             // Any change to how brushes look means the whole layer must be redrawn.
             EventHandler brushChanged = (_, __) =>
@@ -467,6 +468,7 @@ namespace RoadMapper
         {
             public List<MarkerPoint> Points;
             public Dictionary<int, LayerRenderer.Brush> Brushes;
+            public IReadOnlyDictionary<int, MarkerIcon> Markers;
             public LayerRenderer.MapGeometry Geometry;
             public string WorldName;
             public string Reason;
@@ -492,6 +494,7 @@ namespace RoadMapper
             {
                 Points = LoadPointsFromFile(_layerPointsPath),
                 Brushes = brushes,
+                Markers = MapMarkers.ById,
                 Geometry = _layerGeometry,
                 WorldName = _layerWorldName,
                 Reason = reason
@@ -544,7 +547,7 @@ namespace RoadMapper
             lock (_layerWriteLock)
             {
                 System.Diagnostics.Stopwatch sw = System.Diagnostics.Stopwatch.StartNew();
-                byte[] png = LayerRenderer.Render(s.Points, s.Brushes, s.Geometry);
+                byte[] png = LayerRenderer.Render(s.Points, s.Brushes, s.Markers, s.Geometry);
 
                 string dir = NomapPrinterLink.ConfigDirectory;
                 Directory.CreateDirectory(dir);
@@ -590,22 +593,26 @@ namespace RoadMapper
             CreateToolAndPieceTable();
 
             AddMarkerPiece(PathMarkerPrefabName, "Path Marker",
-                "Marks a path outline on the map. Does not affect terrain.", "Icons/PathIcon.png");
+                "Marks a path outline on the map. Does not affect terrain.", LoadIcon("Icons/PathIcon.png"));
             AddMarkerPiece(RoadMarkerPrefabName, "Road Marker",
-                "Like the path marker, but for major roads.", "Icons/RoadIcon.png");
+                "Like the path marker, but for major roads.", LoadIcon("Icons/RoadIcon.png"));
             AddMarkerPiece(WallMarkerPrefabName, "Wall Marker",
-                "Marks out walls on the map.", "Icons/WallIcon.png");
+                "Marks out walls on the map.", LoadIcon("Icons/WallIcon.png"));
             AddMarkerPiece(FenceMarkerPrefabName, "Fence Marker",
-                "Marks out fences on the map.", "Icons/FenceIcon.png");
+                "Marks out fences on the map.", LoadIcon("Icons/FenceIcon.png"));
             AddMarkerPiece(EraserPrefabName, "Mark Eraser",
-                "Erases map marks near where it is used.", "Icons/EraserIcon.png");
+                "Erases map marks near where it is used.", LoadIcon("Icons/EraserIcon.png"));
 
             // In case I feel like adding more tools later:
             // AddMarkerPiece("RoadMapper_SomeMarker", "Some Marker", "Marks out something on the map.", "Icons/SomeIcon.png");
             // ...then give it a brush id in GetBrushId() and a Brush5 config section.
 
-            // Map Markers tab: icon pieces go here (brush ids from 50 up), e.g.
-            // AddMarkerPiece("RoadMapper_Marker_Portal", "Portal Marker", "Marks a portal on the map.", "Icons/Markers/50_portal.png", MapMarkersCategory);
+            // Map Markers tab: one piece per PNG in BepInEx/config/RoadMapper/Markers/ (see MapMarkers).
+            foreach (MarkerIcon marker in MapMarkers.ById.Values)
+            {
+                AddMarkerPiece(marker.PrefabName, marker.Name,
+                    $"Marks a {marker.Name.ToLowerInvariant()} on the map.", marker.Sprite, MapMarkersCategory);
+            }
         }
 
         // The roadmapping tool: its own item with its own piece table, so the marker pieces
@@ -650,7 +657,7 @@ namespace RoadMapper
             ItemManager.Instance.AddItem(tool);
         }
 
-        private static void AddMarkerPiece(string prefabName, string name, string description, string iconPath,
+        private static void AddMarkerPiece(string prefabName, string name, string description, Sprite icon,
             string category = RoadsCategory)
         {
             PieceConfig config = new PieceConfig
@@ -659,7 +666,7 @@ namespace RoadMapper
                 Description = description,
                 PieceTable = PieceTableName,
                 Category = category,
-                Icon = LoadIcon(iconPath)
+                Icon = icon
             };
 
             // Cloned from the hoe's Level Ground piece to borrow its placement ghost.
@@ -695,11 +702,29 @@ namespace RoadMapper
                 case RoadMarkerPrefabName: return 2;
                 case WallMarkerPrefabName: return 3;
                 case FenceMarkerPrefabName: return 4;
-                default: return 0; // not one of mine
+                default:
+                    return MapMarkers.TryGetIdForPrefab(pieceName, out int markerId) ? markerId : 0; // 0 = not one of mine
             }
         }
 
         private static bool IsServer => ZNet.instance != null && ZNet.instance.IsServer();
+
+        // Valheim announces every newly known build piece top-left ("New piece: ..."). With a
+        // marker per icon that's dozens of messages the first time you pick up the Roadmapper, so
+        // marker pieces are learned silently: same bookkeeping as the vanilla method (the piece
+        // goes into m_knownRecipes), just without the message.
+        [HarmonyPatch(typeof(Player), "AddKnownPiece")]
+        public static class Player_AddKnownPiece_Patch
+        {
+            public static bool Prefix(Piece piece, HashSet<string> ___m_knownRecipes)
+            {
+                if (piece == null || !MapMarkers.TryGetIdForPrefab(piece.name, out _))
+                    return true; // not a marker: vanilla behaviour, message and all
+
+                ___m_knownRecipes.Add(piece.m_name);
+                return false;
+            }
+        }
 
         [HarmonyPatch(typeof(Player), nameof(Player.PlacePiece))]
         public static class Player_PlacePiece_Patch
@@ -784,8 +809,14 @@ namespace RoadMapper
         private static (int, int, int) FlagKey(float x, float z, int brushId) =>
             ((int)Math.Round(x * 10f), (int)Math.Round(z * 10f), brushId);
 
-        // Only the line brushes get torches; map marker icons (50+) will get their own flag.
-        private static bool IsRoadBrush(int brushId) => brushId >= 1 && brushId <= 4;
+        // Line brushes (1-4) and loaded map markers (50+) get flags; anything else is ignored.
+        private static bool HasFlag(int brushId) => (brushId >= 1 && brushId <= 4) || MapMarkers.IsMarker(brushId);
+
+        // Markers show a banner on a pole (MarkerBanner), one template per marker. If that can't be
+        // built, every marker falls back to one shared full-size magenta wisp torch, cached under this key.
+        private const int MarkerFlagTemplateKey = -1;
+        private static readonly Color MarkerFlagColour = new Color(1f, 0f, 1f, 1f);
+        private const float MarkerFlagScale = 1f;
 
         private static bool IsHoldingTool(Player player)
         {
@@ -865,7 +896,7 @@ namespace RoadMapper
             HashSet<(int, int, int)> wanted = new HashSet<(int, int, int)>();
             foreach (MarkerPoint p in points)
             {
-                if (!IsRoadBrush(p.BrushId)) continue;
+                if (!HasFlag(p.BrushId)) continue;
                 (int, int, int) key = FlagKey(p.x, p.z, p.BrushId);
                 if (!wanted.Add(key)) continue;
                 if (!_flags.ContainsKey(key))
@@ -896,7 +927,7 @@ namespace RoadMapper
         // Called straight after a local strike, so there's a flag before the server has even heard of it.
         private void SpawnFlag(Vector3 pos, int brushId)
         {
-            if (!_flagsActive || !IsRoadBrush(brushId)) return;
+            if (!_flagsActive || !HasFlag(brushId)) return;
             (int, int, int) key = FlagKey(pos.x, pos.z, brushId);
             if (_flags.ContainsKey(key)) return;
             CreateFlag(key, pos, brushId);
@@ -968,7 +999,30 @@ namespace RoadMapper
         // render. Instantiating a template with no parent gives an active copy.
         private GameObject GetFlagTemplate(int brushId)
         {
+            bool isMarker = MapMarkers.IsMarker(brushId);
             if (_flagTemplates.TryGetValue(brushId, out GameObject cached) && cached != null)
+                return cached;
+
+            if (_flagTemplateRoot == null)
+            {
+                _flagTemplateRoot = new GameObject("RoadMapper_FlagTemplates");
+                _flagTemplateRoot.SetActive(false);
+                DontDestroyOnLoad(_flagTemplateRoot);
+            }
+
+            if (isMarker && MapMarkers.ById.TryGetValue(brushId, out MarkerIcon icon))
+            {
+                GameObject banner = MarkerBanner.Build(icon, _flagTemplateRoot.transform);
+                if (banner != null)
+                {
+                    _flagTemplates[brushId] = banner;
+                    return banner;
+                }
+                // Couldn't build the banner: shared placeholder below.
+            }
+
+            int templateKey = isMarker ? MarkerFlagTemplateKey : brushId;
+            if (_flagTemplates.TryGetValue(templateKey, out cached) && cached != null)
                 return cached;
 
             GameObject source = ZNetScene.instance != null ? ZNetScene.instance.GetPrefab(FlagSourcePrefabName) : null;
@@ -982,24 +1036,28 @@ namespace RoadMapper
                 return null;
             }
 
-            if (_flagTemplateRoot == null)
+            Color colour;
+            float scale;
+            if (isMarker)
             {
-                _flagTemplateRoot = new GameObject("RoadMapper_FlagTemplates");
-                _flagTemplateRoot.SetActive(false);
-                DontDestroyOnLoad(_flagTemplateRoot);
+                colour = MarkerFlagColour;
+                scale = MarkerFlagScale;
+            }
+            else
+            {
+                (_, string colourHex) = GetBrushConfig(brushId);
+                if (!ColorUtility.TryParseHtmlString(colourHex, out colour))
+                    colour = Color.white;
+                colour.a = 1f;
+                scale = FlagScale;
             }
 
-            (_, string colourHex) = GetBrushConfig(brushId);
-            if (!ColorUtility.TryParseHtmlString(colourHex, out Color colour))
-                colour = Color.white;
-            colour.a = 1f;
-
-            GameObject template = BuildFlagTemplate(source, colour, brushId, _flagTemplateRoot.transform);
-            _flagTemplates[brushId] = template;
+            GameObject template = BuildFlagTemplate(source, colour, templateKey, scale, _flagTemplateRoot.transform);
+            _flagTemplates[templateKey] = template;
             return template;
         }
 
-        private static GameObject BuildFlagTemplate(GameObject source, Color colour, int brushId, Transform inactiveParent)
+        private static GameObject BuildFlagTemplate(GameObject source, Color colour, int brushId, float scale, Transform inactiveParent)
         {
             // Instantiated under an inactive parent, so no Awake/Start runs on any of the torch's
             // scripts (ZNetView, Fireplace, WearNTear...) and it's safe to rip them out.
@@ -1118,13 +1176,13 @@ namespace RoadMapper
             if (flameInfo.Count > 0)
                 Jotunn.Logger.LogDebug($"[RoadMapper] Flag {brushId} flame materials: {string.Join(", ", flameInfo)}");
 
-            root.transform.localScale = Vector3.one * FlagScale;
+            root.transform.localScale = Vector3.one * scale;
             return root;
         }
 
         // Keeps only what's needed to draw the torch. Everything else is removed in an order that
         // respects [RequireComponent], so nothing is destroyed while another component needs it.
-        private static void StripToVisuals(GameObject root)
+        internal static void StripToVisuals(GameObject root)
         {
             List<Component> doomed = new List<Component>();
             foreach (Component c in root.GetComponentsInChildren<Component>(true))
