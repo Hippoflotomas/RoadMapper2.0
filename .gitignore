@@ -1,0 +1,28 @@
+# Visual Studio
+.vs/
+*.user
+*.suo
+*.userprefs
+
+# Build output
+[Bb]in/
+[Oo]bj/
+[Dd]ebug/
+[Rr]elease/
+*.pdb
+*.mdb
+
+# Keep the Jotunn build helper
+!libraries/Debug/
+!libraries/Debug/pdb2mdb.exe
+
+# Unity stub project generated folders
+JotunnModStubUnity/[Ll]ibrary/
+JotunnModStubUnity/[Tt]emp/
+JotunnModStubUnity/[Ll]ogs/
+JotunnModStubUnity/[Uu]ser[Ss]ettings/
+JotunnModStubUnity/[Bb]uild/
+
+# Package build output (keep manifest/icon/README)
+RoadMapper2.0/Package/plugins/
+*.zip
