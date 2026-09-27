@@ -26,3 +26,6 @@ JotunnModStubUnity/[Bb]uild/
 # Package build output (keep manifest/icon/README)
 RoadMapper2.0/Package/plugins/
 *.zip
+
+# Thunderstore upload staging (copies + built DLL; zipped by hand)
+/Publishables/

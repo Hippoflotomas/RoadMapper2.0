@@ -33,6 +33,11 @@ Mark roads, walls, fences and places while you walk, and have them drawn onto [N
 
 Markers are 16x16 (up to 64x64) PNGs named `<id>_<name>.png`, ids from 50 up, e.g. `67_Portal.png`. The bundled set lives in the mod's `Markers` folder. Extra or replacement markers go in `BepInEx/config/RoadMapper/Markers/` (a file there with a bundled id replaces that marker). One PNG pixel is one map pixel (6 m at the default map size). Only the id is stored for a placed marker, so don't renumber markers once they're in use. Custom markers must be copied to the server and every client.
 
+## Credits
+
+- Map marker icons: [1-bit Pixel Icons](https://nikoichu.itch.io/pixel-icons) by **Nikoichu** (CC0 1.0). Thank you!
+- The banner-image technique (rebuilding the cloth's UVs so a custom image covers the whole banner) comes from my BannerShare mod.
+
 ## Changelog
 
 ### 2.1.0
