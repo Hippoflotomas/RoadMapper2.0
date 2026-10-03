@@ -40,7 +40,7 @@ namespace RoadMapper
     {
         public const string PluginGUID = "com.jotunn.RoadMapper";
         public const string PluginName = "RoadMapper";
-        public const string PluginVersion = "2.1.0";
+        public const string PluginVersion = "2.2.0";
 
         // Prefab names kept identical to 1.x so pieces already placed in a world still resolve.
         public const string PathMarkerPrefabName = "RoadMapper_PathMarker";
@@ -48,6 +48,19 @@ namespace RoadMapper
         public const string WallMarkerPrefabName = "RoadMapper_WallMarker";
         public const string FenceMarkerPrefabName = "RoadMapper_FenceMarker";
         public const string EraserPrefabName = "RoadMapper_Eraser";
+
+        // Admin pieces (overfog layer): same brushes and markers, prefab name with "Admin_" after
+        // the "RoadMapper_" prefix, e.g. RoadMapper_Admin_PathMarker, RoadMapper_Admin_Marker_54.
+        // They record into a separate point file that's drawn on NomapPrinter's OVER-fog layer,
+        // so everyone sees them, explored or not. Hidden from non-admins; the server also refuses
+        // admin strikes and erases from anyone who isn't on its admin list.
+        public const string AdminPrefix = "RoadMapper_Admin_";
+        public const string AdminEraserPrefabName = "RoadMapper_AdminEraser";
+        // Added to an admin point's brush id when it's sent to clients (flags, pins), so the two
+        // sets stay apart. Never stored: each file holds plain brush ids.
+        internal const int AdminIdOffset = 100000;
+        internal static bool IsAdminId(int id) => id >= AdminIdOffset;
+        internal static int BaseId(int id) => id >= AdminIdOffset ? id - AdminIdOffset : id;
 
         // The dedicated roadmapping tool and its build menu.
         public const string ToolPrefabName = "RoadMapper_Tool";
@@ -71,6 +84,8 @@ namespace RoadMapper
         public static CustomRPC LayerFlushRPC;
         public static CustomRPC FlagPointsRPC;
         public static CustomRPC MarkerPinsRPC;
+        public static CustomRPC AdminMarkRPC;
+        public static CustomRPC AdminEraseRPC;
 
         // ---------------------------------------------------------------------
         // Config
@@ -106,6 +121,7 @@ namespace RoadMapper
 
         // Marker pins (client-side, per player)
         private ConfigEntry<bool> _showMarkerPins;
+        private ConfigEntry<bool> _removeDeathPins;
 
         private Harmony _harmony;
 
@@ -120,7 +136,7 @@ namespace RoadMapper
             // Any change to how brushes look means the whole layer must be redrawn.
             EventHandler brushChanged = (_, __) =>
             {
-                MarkLayerDirty("brush config changed", writeNow: true);
+                MarkLayerDirty("brush config changed", LayerKind.Both, writeNow: true);
                 ClearFlagTemplates();
                 if (_flagsActive && Player.m_localPlayer != null)
                 {
@@ -163,6 +179,16 @@ namespace RoadMapper
                 "RoadMapper_MarkerPinsRPC",
                 ServerReceiveMarkerPinsRequest,
                 ClientReceiveMarkerPins);
+
+            // Admin (overfog) strikes and erases. Sent to the server only, which checks the sender.
+            AdminMarkRPC = NetworkManager.Instance.AddRPC(
+                "RoadMapper_AdminMarkRPC",
+                ServerReceiveAdminMark,
+                ClientReceiveNothing);
+            AdminEraseRPC = NetworkManager.Instance.AddRPC(
+                "RoadMapper_AdminEraseRPC",
+                ServerReceiveAdminErase,
+                ClientReceiveNothing);
 
             _harmony = new Harmony(PluginGUID);
             _harmony.PatchAll();
@@ -237,6 +263,8 @@ namespace RoadMapper
                 if (_showMarkerPins.Value) _markerPinsRequested = false; // re-fetch on next Update
                 else RemoveMarkerPins();
             };
+            _removeDeathPins = Config.Bind("Pins", "Remove death pins", true,
+                "Remove a death pin once its gravestone is gone: when you empty your grave, or when you pass the pin and its grave has been looted. Only pins within 20 m of you are checked, after their area has loaded.");
             _flagRadius = Config.Bind("Flags", "Radius", 100f,
                 $"Show flags for recorded points within this many metres of you (the server caps it at {MaxFlagRadius:0} m).");
         }
@@ -264,10 +292,13 @@ namespace RoadMapper
         // flush can still run when ZNet is already gone (quit / back to menu).
         private bool _layerReady;
         private string _layerWorldName;
-        private string _layerPointsPath;
+        private string _layerPointsPath;      // underfog: <World>.txt
+        private string _overfogPointsPath;    // overfog (admin): <World>.overfog.txt
         private LayerRenderer.MapGeometry _layerGeometry;
 
-        private bool _layerDirty;
+        // Which layers have changes not yet written.
+        private LayerKind _dirtyKinds;
+        private bool _layerDirty => _dirtyKinds != LayerKind.None;
         private float _dirtySince;
         private int _strikesSinceWrite;
         private bool _writeRequested;
@@ -284,6 +315,8 @@ namespace RoadMapper
                 CheckForRefreshedLayer();
             UpdateFlags();
             UpdateMarkerPins();
+            DeathPins.Update(_removeDeathPins.Value);
+            UpdateAdminPieces();
 
             bool serverWorldUp = IsServer && !string.IsNullOrEmpty(ZNet.instance.GetWorldName());
 
@@ -326,6 +359,7 @@ namespace RoadMapper
         {
             _layerWorldName = ZNet.instance.GetWorldName();
             _layerPointsPath = GetWorldDataFilePath();
+            _overfogPointsPath = GetWorldDataFilePath(LayerKind.Overfog);
             _layerGeometry = LayerRenderer.MapGeometry.FromMultiplier(NomapPrinterLink.MapSizeMultiplier);
             _layerReady = true;
 
@@ -333,28 +367,27 @@ namespace RoadMapper
                 $"{_layerGeometry.TextureSize}px, {_layerGeometry.PixelSize} m/px, NomapPrinter map type {NomapPrinterLink.MapType}. " +
                 $"Writing to {NomapPrinterLink.ConfigDirectory}");
 
-            foreach (string problem in NomapPrinterLink.CheckSettings())
+            bool hasOverfogPoints = LoadPointsFromFile(_overfogPointsPath).Count > 0;
+            foreach (string problem in NomapPrinterLink.CheckSettings(hasOverfogPoints))
                 Jotunn.Logger.LogWarning($"[RoadMapper] {problem}");
 
-            // Always redraw once at startup so the layer matches the current points, brushes and map size.
-            MarkLayerDirty("server start", writeNow: true);
+            // Always redraw once at startup so the layers match the current points, brushes and map size.
+            MarkLayerDirty("server start", LayerKind.Both, writeNow: true);
         }
 
         // Called for every strike and every successful erase.
-        private void OnLayerStrike()
+        private void OnLayerStrike(LayerKind kind)
         {
             _strikesSinceWrite++;
             int perWrite = Math.Max(1, _strikesPerWrite.Value);
-            MarkLayerDirty($"{perWrite} strikes", writeNow: _strikesSinceWrite >= perWrite);
+            MarkLayerDirty($"{perWrite} strikes", kind, writeNow: _strikesSinceWrite >= perWrite);
         }
 
-        private void MarkLayerDirty(string reason, bool writeNow)
+        private void MarkLayerDirty(string reason, LayerKind kind, bool writeNow)
         {
             if (!_layerDirty)
-            {
-                _layerDirty = true;
                 _dirtySince = Time.unscaledTime;
-            }
+            _dirtyKinds |= kind;
             if (writeNow)
                 RequestLayerWrite(reason);
         }
@@ -386,6 +419,7 @@ namespace RoadMapper
         // Client state
         private float _awaitingLayerUntil;
         private string _layerAtPrint;
+        private string _overfogAtPrint;
         private bool _reprinting;
 
         // Server state
@@ -420,6 +454,7 @@ namespace RoadMapper
             }
 
             _layerAtPrint = NomapPrinterLink.CurrentUnderfogLayer;
+            _overfogAtPrint = NomapPrinterLink.CurrentOverfogLayer;
             _awaitingLayerUntil = Time.unscaledTime + RefreshWaitSeconds;
 
             if (IsServer)
@@ -441,7 +476,9 @@ namespace RoadMapper
             }
 
             // A synced layer is a fresh string, so reference inequality means "new layer arrived".
-            if (ReferenceEquals(NomapPrinterLink.CurrentUnderfogLayer, _layerAtPrint))
+            // Either layer counts (the overfog value reads null if it can't be found).
+            if (ReferenceEquals(NomapPrinterLink.CurrentUnderfogLayer, _layerAtPrint)
+                && ReferenceEquals(NomapPrinterLink.CurrentOverfogLayer, _overfogAtPrint))
                 return;
 
             _awaitingLayerUntil = 0f;
@@ -486,7 +523,8 @@ namespace RoadMapper
 
         private struct LayerSnapshot
         {
-            public List<MarkerPoint> Points;
+            // One entry per layer to write.
+            public List<(LayerKind Kind, List<MarkerPoint> Points)> Layers;
             public Dictionary<int, LayerRenderer.Brush> Brushes;
             public IReadOnlyDictionary<int, MarkerIcon> Markers;
             public LayerRenderer.MapGeometry Geometry;
@@ -495,7 +533,7 @@ namespace RoadMapper
         }
 
         // Main thread only: reads config and Unity colour parsing.
-        private LayerSnapshot TakeLayerSnapshot(string reason)
+        private LayerSnapshot TakeLayerSnapshot(string reason, LayerKind kinds)
         {
             Dictionary<int, LayerRenderer.Brush> brushes = new Dictionary<int, LayerRenderer.Brush>();
             for (int id = 1; id <= 4; id++)
@@ -512,7 +550,7 @@ namespace RoadMapper
 
             return new LayerSnapshot
             {
-                Points = LoadPointsFromFile(_layerPointsPath),
+                Layers = SnapshotLayers(kinds),
                 Brushes = brushes,
                 Markers = MapMarkers.ById,
                 Geometry = _layerGeometry,
@@ -521,10 +559,20 @@ namespace RoadMapper
             };
         }
 
+        private List<(LayerKind, List<MarkerPoint>)> SnapshotLayers(LayerKind kinds)
+        {
+            List<(LayerKind, List<MarkerPoint>)> layers = new List<(LayerKind, List<MarkerPoint>)>();
+            if ((kinds & LayerKind.Underfog) != 0)
+                layers.Add((LayerKind.Underfog, LoadPointsFromFile(_layerPointsPath)));
+            if ((kinds & LayerKind.Overfog) != 0)
+                layers.Add((LayerKind.Overfog, LoadPointsFromFile(_overfogPointsPath)));
+            return layers;
+        }
+
         private void StartBackgroundLayerWrite(string reason)
         {
-            LayerSnapshot snapshot = TakeLayerSnapshot(reason);
-            _layerDirty = false;
+            LayerSnapshot snapshot = TakeLayerSnapshot(reason, _dirtyKinds);
+            _dirtyKinds = LayerKind.None;
             _strikesSinceWrite = 0;
             _layerJobRunning = true;
 
@@ -551,8 +599,9 @@ namespace RoadMapper
             if (!_layerReady || !_layerDirty) return;
             try
             {
-                _layerDirty = false;
-                WriteLayerFiles(TakeLayerSnapshot(reason));
+                LayerKind kinds = _dirtyKinds;
+                _dirtyKinds = LayerKind.None;
+                WriteLayerFiles(TakeLayerSnapshot(reason, kinds));
             }
             catch (Exception ex)
             {
@@ -566,15 +615,32 @@ namespace RoadMapper
         {
             lock (_layerWriteLock)
             {
-                System.Diagnostics.Stopwatch sw = System.Diagnostics.Stopwatch.StartNew();
-                byte[] png = LayerRenderer.Render(s.Points, s.Brushes, s.Markers, s.Geometry);
+                foreach ((LayerKind kind, List<MarkerPoint> points) in s.Layers)
+                    WriteLayer(s, kind, points);
+            }
+        }
 
+        // Caller holds _layerWriteLock (the renderer shares one pixel buffer).
+        private void WriteLayer(LayerSnapshot s, LayerKind kind, List<MarkerPoint> points)
+        {
+            {
                 string dir = NomapPrinterLink.ConfigDirectory;
                 Directory.CreateDirectory(dir);
+                string suffix = kind == LayerKind.Overfog ? "overfog" : "underfog";
+
+                // No admin markings and no overfog file yet: don't create one (it would be synced
+                // to every client for nothing). Once a file exists it's always rewritten, so
+                // erasing the last admin marking clears it.
+                if (kind == LayerKind.Overfog && points.Count == 0
+                    && !File.Exists(Path.Combine(dir, NomapPrinterLink.LayerFileName(NomapPrinterLink.LayerMapTypes[0], s.WorldName, suffix))))
+                    return;
+
+                System.Diagnostics.Stopwatch sw = System.Diagnostics.Stopwatch.StartNew();
+                byte[] png = LayerRenderer.Render(points, s.Brushes, s.Markers, s.Geometry);
 
                 foreach (string mapType in NomapPrinterLink.LayerMapTypes)
                 {
-                    string dest = Path.Combine(dir, NomapPrinterLink.LayerFileName(mapType, s.WorldName));
+                    string dest = Path.Combine(dir, NomapPrinterLink.LayerFileName(mapType, s.WorldName, suffix));
                     // Write under a name NomapPrinter ignores, then swap it in, so its file watcher
                     // never reads a half-written PNG.
                     string tmp = dest + ".tmp";
@@ -597,7 +663,7 @@ namespace RoadMapper
                     }
                 }
 
-                Jotunn.Logger.LogInfo($"[RoadMapper] Road layer written ({s.Reason}): {s.Points.Count} points, " +
+                Jotunn.Logger.LogInfo($"[RoadMapper] {(kind == LayerKind.Overfog ? "Admin overfog" : "Road")} layer written ({s.Reason}): {points.Count} points, " +
                     $"{png.Length / 1024} KB, {sw.ElapsedMilliseconds} ms.");
             }
         }
@@ -632,6 +698,105 @@ namespace RoadMapper
             {
                 AddMarkerPiece(marker.PrefabName, marker.Name,
                     $"Marks a {marker.Name.ToLowerInvariant()} on the map.", marker.Sprite, MapMarkersCategory);
+            }
+
+            // Admin pieces, at the end of the same tabs. They draw on the over-fog layer, which
+            // everyone sees whether they've explored there or not.
+            const string adminNote = " Admin only: shows on everyone's map, even where they haven't explored.";
+            AddAdminPiece(PathMarkerPrefabName, "Admin Path Marker", "Marks a path outline." + adminNote, LoadIcon("Icons/PathIcon.png"), RoadsCategory);
+            AddAdminPiece(RoadMarkerPrefabName, "Admin Road Marker", "Marks a major road." + adminNote, LoadIcon("Icons/RoadIcon.png"), RoadsCategory);
+            AddAdminPiece(WallMarkerPrefabName, "Admin Wall Marker", "Marks out walls." + adminNote, LoadIcon("Icons/WallIcon.png"), RoadsCategory);
+            AddAdminPiece(FenceMarkerPrefabName, "Admin Fence Marker", "Marks out fences." + adminNote, LoadIcon("Icons/FenceIcon.png"), RoadsCategory);
+            _adminPieces.Add(AddMarkerPiece(AdminEraserPrefabName, "Admin Mark Eraser",
+                "Erases admin map marks near where it is used. Doesn't touch ordinary marks. Admin only.",
+                AdminIcon(LoadIcon("Icons/EraserIcon.png"))).Piece);
+            foreach (MarkerIcon marker in MapMarkers.ById.Values)
+            {
+                AddAdminPiece(marker.PrefabName, "Admin " + marker.Name,
+                    $"Marks a {marker.Name.ToLowerInvariant()}." + adminNote, marker.Sprite, MapMarkersCategory);
+            }
+
+            // Hidden until we know this player is an admin.
+            foreach (Piece piece in _adminPieces)
+                if (piece != null) piece.m_enabled = false;
+            _adminPiecesShown = false;
+        }
+
+        private static readonly List<Piece> _adminPieces = new List<Piece>();
+        private static bool _adminPiecesShown;
+        private float _nextAdminCheck;
+
+        private static void AddAdminPiece(string basePrefabName, string name, string description, Sprite icon, string category)
+        {
+            string prefabName = AdminPrefix + basePrefabName.Substring("RoadMapper_".Length);
+            _adminPieces.Add(AddMarkerPiece(prefabName, name, description, AdminIcon(icon), category).Piece);
+        }
+
+        // This player counts as an admin when they're the host / single player, or the server has
+        // told Jotunn they're on its admin list.
+        internal static bool LocalPlayerIsAdmin =>
+            ZNet.instance != null && (ZNet.instance.IsServer() || SynchronizationManager.Instance.PlayerIsAdmin);
+
+        private static readonly MethodInfo UpdateAvailablePiecesListMethod =
+            AccessTools.Method(typeof(Player), "UpdateAvailablePiecesList");
+
+        // Shows or hides the admin pieces when admin status changes. Hiding is cosmetic; the
+        // server's sender check is what actually stops a non-admin.
+        private void UpdateAdminPieces()
+        {
+            if (Time.unscaledTime < _nextAdminCheck) return;
+            _nextAdminCheck = Time.unscaledTime + 1f;
+
+            bool show = LocalPlayerIsAdmin;
+            if (show == _adminPiecesShown) return;
+            _adminPiecesShown = show;
+            foreach (Piece piece in _adminPieces)
+                if (piece != null) piece.m_enabled = show;
+
+            if (Player.m_localPlayer != null && UpdateAvailablePiecesListMethod != null)
+                UpdateAvailablePiecesListMethod.Invoke(Player.m_localPlayer, null);
+            Jotunn.Logger.LogInfo($"[RoadMapper] Admin pieces {(show ? "shown" : "hidden")}.");
+        }
+
+        // The ordinary icon with a gold frame, so admin pieces stand out in the build menu.
+        private static Sprite AdminIcon(Sprite source)
+        {
+            if (source == null) return null;
+            try
+            {
+                Rect r = source.textureRect;
+                int w = (int)r.width, h = (int)r.height;
+                Color32[] all = source.texture.GetPixels32();
+                int texW = source.texture.width;
+                Color32[] px = new Color32[w * h];
+                for (int y = 0; y < h; y++)
+                    for (int x = 0; x < w; x++)
+                        px[y * w + x] = all[((int)r.y + y) * texW + (int)r.x + x];
+
+                int t = Math.Max(1, Math.Min(w, h) / 16);
+                Color32 gold = new Color32(255, 196, 40, 255);
+                for (int y = 0; y < h; y++)
+                    for (int x = 0; x < w; x++)
+                        if (x < t || y < t || x >= w - t || y >= h - t)
+                            px[y * w + x] = gold;
+
+                Texture2D tex = new Texture2D(w, h, TextureFormat.RGBA32, false)
+                {
+                    filterMode = source.texture.filterMode,
+                    wrapMode = TextureWrapMode.Clamp,
+                    name = source.texture.name + "_Admin"
+                };
+                tex.SetPixels32(px);
+                tex.Apply(false);
+                Sprite sprite = Sprite.Create(tex, new Rect(0, 0, w, h), new Vector2(0.5f, 0.5f));
+                sprite.name = source.name + "_Admin";
+                return sprite;
+            }
+            catch (Exception ex)
+            {
+                // e.g. an unreadable texture: the plain icon will do.
+                Jotunn.Logger.LogWarning($"[RoadMapper] Admin icon for '{source.name}' not framed: {ex.Message}");
+                return source;
             }
         }
 
@@ -680,7 +845,7 @@ namespace RoadMapper
             ItemManager.Instance.AddItem(tool);
         }
 
-        private static void AddMarkerPiece(string prefabName, string name, string description, Sprite icon,
+        private static CustomPiece AddMarkerPiece(string prefabName, string name, string description, Sprite icon,
             string category = RoadsCategory)
         {
             PieceConfig config = new PieceConfig
@@ -702,6 +867,7 @@ namespace RoadMapper
             piece.PiecePrefab.AddComponent<MarkerPieceCleanup>();
 
             PieceManager.Instance.AddPiece(piece);
+            return piece;
         }
 
         // Icons live in an Icons folder next to the DLL.
@@ -717,8 +883,12 @@ namespace RoadMapper
             return AssetUtils.LoadSpriteFromFile(spritePath);
         }
 
-        private static int GetBrushId(string pieceName)
+        // Brush id for a piece, and whether it's an admin (overfog) piece. 0 = not one of mine.
+        private static int GetBrushId(string pieceName, out bool admin)
         {
+            admin = pieceName.StartsWith(AdminPrefix, StringComparison.Ordinal);
+            if (admin)
+                pieceName = "RoadMapper_" + pieceName.Substring(AdminPrefix.Length);
             switch (pieceName)
             {
                 case PathMarkerPrefabName: return 1;
@@ -741,7 +911,8 @@ namespace RoadMapper
         {
             public static bool Prefix(Piece piece, HashSet<string> ___m_knownRecipes)
             {
-                if (piece == null || !MapMarkers.TryGetIdForPrefab(piece.name, out _))
+                if (piece == null || !(MapMarkers.TryGetIdForPrefab(piece.name, out _)
+                        || piece.name.StartsWith(AdminPrefix, StringComparison.Ordinal) || piece.name == AdminEraserPrefabName))
                     return true; // not a marker: vanilla behaviour, message and all
 
                 ___m_knownRecipes.Add(piece.m_name);
@@ -756,12 +927,23 @@ namespace RoadMapper
             {
                 if (piece == null) return;
 
+                if (piece.name == AdminEraserPrefabName)
+                {
+                    if (!LocalPlayerIsAdmin) return;
+                    Instance.RemoveFlagsNear(pos, admin: true);
+                    if (IsServer)
+                        Instance.EraseMarkersNear(pos.x, pos.z, LayerKind.Overfog);
+                    else
+                        SendToServer(AdminEraseRPC, pos.x, pos.z, null);
+                    return;
+                }
+
                 if (piece.name == EraserPrefabName)
                 {
-                    Instance.RemoveFlagsNear(pos);
+                    Instance.RemoveFlagsNear(pos, admin: false);
                     if (IsServer)
                     {
-                        Instance.EraseMarkersNear(pos.x, pos.z);
+                        Instance.EraseMarkersNear(pos.x, pos.z, LayerKind.Underfog);
                     }
                     else
                     {
@@ -774,14 +956,25 @@ namespace RoadMapper
                     return;
                 }
 
-                int brushId = GetBrushId(piece.name);
+                int brushId = GetBrushId(piece.name, out bool admin);
                 if (brushId == 0) return;
+
+                if (admin)
+                {
+                    if (!LocalPlayerIsAdmin) return;
+                    Instance.SpawnFlag(pos, brushId + AdminIdOffset);
+                    if (IsServer)
+                        Instance.RecordMarkerPoint(pos.x, pos.z, brushId, LayerKind.Overfog);
+                    else
+                        SendToServer(AdminMarkRPC, pos.x, pos.z, brushId);
+                    return;
+                }
 
                 Instance.SpawnFlag(pos, brushId);
 
                 if (IsServer)
                 {
-                    Instance.RecordMarkerPoint(pos.x, pos.z, brushId);
+                    Instance.RecordMarkerPoint(pos.x, pos.z, brushId, LayerKind.Underfog);
                     return;
                 }
 
@@ -792,6 +985,18 @@ namespace RoadMapper
                 PathMarkerRPC.SendPackage(ZRoutedRpc.Everybody, package);
                 Jotunn.Logger.LogDebug($"[RoadMapper] Paint coord sent: ({pos.x}, {pos.z}, {brushId})");
             }
+        }
+
+        // Admin RPCs go to the server peer only.
+        private static void SendToServer(CustomRPC rpc, float x, float z, int? brushId)
+        {
+            ZNetPeer server = ZNet.instance != null ? ZNet.instance.GetServerPeer() : null;
+            if (server == null) return;
+            ZPackage package = new ZPackage();
+            package.Write(x);
+            package.Write(z);
+            if (brushId.HasValue) package.Write(brushId.Value);
+            rpc.SendPackage(server.m_uid, package);
         }
 
         // ---------------------------------------------------------------------
@@ -832,8 +1037,23 @@ namespace RoadMapper
         private static (int, int, int) FlagKey(float x, float z, int brushId) =>
             ((int)Math.Round(x * 10f), (int)Math.Round(z * 10f), brushId);
 
-        // Line brushes (1-4) and loaded map markers (50+) get flags; anything else is ignored.
-        private static bool HasFlag(int brushId) => (brushId >= 1 && brushId <= 4) || MapMarkers.IsMarker(brushId);
+        // Line brushes (1-4) and loaded map markers (50+) get flags, admin or not; anything else is ignored.
+        private static bool HasFlag(int brushId)
+        {
+            int id = BaseId(brushId);
+            return (id >= 1 && id <= 4) || MapMarkers.IsMarker(id);
+        }
+
+        // Admin points look different, so players can see a road is the server's and not theirs:
+        // line brushes are a trio of wisps joined at the base and splayed out at the top (same tint,
+        // so colours read the same as ordinary flags) around an untinted standing iron torch, and
+        // marker banners are gold instead of purple.
+        // (Tried and dropped: the standing iron torch and the Dvergr pole lantern; their colours
+        // were too hard to tell apart.)
+        private const int AdminTrioCount = 3;
+        private const float AdminTrioSplay = 20f;     // degrees each wisp leans out from upright
+        private const string AdminTorchPrefabName = "piece_groundtorch"; // Standing iron torch, natural flame
+        private static readonly Color32 AdminBannerColour = new Color32(201, 162, 39, 255); // gold
 
         // Markers show a banner on a pole (MarkerBanner), one template per marker. If that can't be
         // built, every marker falls back to one shared full-size magenta wisp torch, cached under this key.
@@ -994,12 +1214,13 @@ namespace RoadMapper
             return d.x * d.x + d.z * d.z;
         }
 
-        private void RemoveFlagsNear(Vector3 pos)
+        // Each eraser only takes down its own kind of flag, the same as on the server.
+        private void RemoveFlagsNear(Vector3 pos, bool admin)
         {
             float r2 = _eraserSize.Value * _eraserSize.Value;
             List<(int, int, int)> doomed = new List<(int, int, int)>();
             foreach (KeyValuePair<(int, int, int), GameObject> kv in _flags)
-                if (FlatDistanceSq(kv.Value, pos) <= r2) doomed.Add(kv.Key);
+                if (IsAdminId(kv.Key.Item3) == admin && FlatDistanceSq(kv.Value, pos) <= r2) doomed.Add(kv.Key);
             foreach ((int, int, int) key in doomed)
                 DestroyFlag(key);
         }
@@ -1020,10 +1241,12 @@ namespace RoadMapper
 
         // One template per brush, kept under an inactive holder so the templates themselves never
         // render. Instantiating a template with no parent gives an active copy.
-        private GameObject GetFlagTemplate(int brushId)
+        private GameObject GetFlagTemplate(int flagId)
         {
+            bool admin = IsAdminId(flagId);
+            int brushId = BaseId(flagId);
             bool isMarker = MapMarkers.IsMarker(brushId);
-            if (_flagTemplates.TryGetValue(brushId, out GameObject cached) && cached != null)
+            if (_flagTemplates.TryGetValue(flagId, out GameObject cached) && cached != null)
                 return cached;
 
             if (_flagTemplateRoot == null)
@@ -1035,16 +1258,16 @@ namespace RoadMapper
 
             if (isMarker && MapMarkers.ById.TryGetValue(brushId, out MarkerIcon icon))
             {
-                GameObject banner = MarkerBanner.Build(icon, _flagTemplateRoot.transform);
+                GameObject banner = MarkerBanner.Build(icon, _flagTemplateRoot.transform, background: admin ? AdminBannerColour : (Color32?)null);
                 if (banner != null)
                 {
-                    _flagTemplates[brushId] = banner;
+                    _flagTemplates[flagId] = banner;
                     return banner;
                 }
                 // Couldn't build the banner: shared placeholder below.
             }
 
-            int templateKey = isMarker ? MarkerFlagTemplateKey : brushId;
+            int templateKey = isMarker ? MarkerFlagTemplateKey : flagId;
             if (_flagTemplates.TryGetValue(templateKey, out cached) && cached != null)
                 return cached;
 
@@ -1075,9 +1298,70 @@ namespace RoadMapper
                 scale = FlagScale;
             }
 
-            GameObject template = BuildFlagTemplate(source, colour, templateKey, scale, _flagTemplateRoot.transform);
+            GameObject template = admin && !isMarker
+                ? BuildAdminTrio(source, colour, templateKey, scale, _flagTemplateRoot.transform)
+                : BuildFlagTemplate(source, colour, templateKey, scale, _flagTemplateRoot.transform);
             _flagTemplates[templateKey] = template;
             return template;
+        }
+
+        // Three ordinary flags sharing one foot, turned 120 degrees apart and each leaning outward.
+        // The wisp's pivot is at its foot, so the lean pivots on the shared base.
+        private static GameObject BuildAdminTrio(GameObject source, Color colour, int flagId, float scale, Transform inactiveParent)
+        {
+            GameObject root = new GameObject($"RoadMapper_AdminFlag_{flagId}");
+            root.transform.SetParent(inactiveParent, false);
+            for (int i = 0; i < AdminTrioCount; i++)
+            {
+                GameObject wisp = BuildFlagTemplate(source, colour, flagId, scale, root.transform);
+                wisp.transform.localPosition = Vector3.zero;
+                wisp.transform.localRotation = Quaternion.Euler(0f, i * 360f / AdminTrioCount, 0f) * Quaternion.Euler(AdminTrioSplay, 0f, 0f);
+            }
+
+            // An iron torch in the middle, with its own orange flame (not tinted), so the cluster
+            // reads as "admin" at a glance. Skipped if the prefab can't be found.
+            GameObject torchSource = ZNetScene.instance != null ? ZNetScene.instance.GetPrefab(AdminTorchPrefabName) : null;
+            if (torchSource != null)
+            {
+                GameObject torch = BuildPlainTemplate(torchSource, scale, root.transform);
+                torch.transform.localPosition = Vector3.zero;
+                torch.transform.localRotation = Quaternion.identity;
+            }
+            return root;
+        }
+
+        // A prefab stripped to its meshes and fire, in its own colours.
+        private static GameObject BuildPlainTemplate(GameObject source, float scale, Transform inactiveParent)
+        {
+            GameObject root = Instantiate(source, inactiveParent, false);
+            root.name = $"RoadMapper_Plain_{source.name}";
+            root.transform.localPosition = Vector3.zero;
+            root.transform.localRotation = Quaternion.identity;
+
+            Fireplace fireplace = root.GetComponent<Fireplace>();
+            if (fireplace != null)
+            {
+                if (fireplace.m_enabledObject != null) fireplace.m_enabledObject.SetActive(true);
+                if (fireplace.m_enabledObjectLow != null)
+                {
+                    fireplace.m_enabledObjectLow.SetActive(true);
+                    if (fireplace.m_enabledObjectHigh != null) fireplace.m_enabledObjectHigh.SetActive(false);
+                }
+                else if (fireplace.m_enabledObjectHigh != null)
+                {
+                    fireplace.m_enabledObjectHigh.SetActive(true);
+                }
+            }
+
+            StripToVisuals(root);
+            foreach (ParticleSystem ps in root.GetComponentsInChildren<ParticleSystem>(true))
+            {
+                ParticleSystem.MainModule main = ps.main;
+                main.scalingMode = ParticleSystemScalingMode.Hierarchy; // so the scale applies to the flame too
+            }
+            StandOnGround(root, source.name);
+            root.transform.localScale = Vector3.one * scale;
+            return root;
         }
 
         internal static GameObject BuildFlagTemplate(GameObject source, Color colour, int brushId, float scale, Transform inactiveParent)
@@ -1199,8 +1483,24 @@ namespace RoadMapper
             if (flameInfo.Count > 0)
                 Jotunn.Logger.LogDebug($"[RoadMapper] Flag {brushId} flame materials: {string.Join(", ", flameInfo)}");
 
+            // Stand it on the ground: not every prefab's pivot is at its foot (the Dvergr pole
+            // lantern's is near the top, so it came out mostly buried). Lift the children so the
+            // lowest mesh point sits at the root's origin, which is placed on the ground.
+            StandOnGround(root, source.name);
+
             root.transform.localScale = Vector3.one * scale;
             return root;
+        }
+
+        private static void StandOnGround(GameObject root, string label)
+        {
+            if (MarkerBanner.TryGetBounds(root, root.transform, null, out Bounds b, visibleOnly: true) && Mathf.Abs(b.min.y) > 0.01f)
+            {
+                Vector3 lift = new Vector3(0f, -b.min.y, 0f);
+                foreach (Transform child in root.transform)
+                    child.localPosition += lift;
+                Jotunn.Logger.LogDebug($"[RoadMapper] Flag model '{label}' lifted {lift.y:0.00} m to stand on the ground.");
+            }
         }
 
         // Keeps only what's needed to draw the torch. Everything else is removed in an order that
@@ -1319,7 +1619,7 @@ namespace RoadMapper
             float x = package.ReadSingle();
             float z = package.ReadSingle();
             int brushId = package.ReadInt();
-            RecordMarkerPoint(x, z, brushId);
+            RecordMarkerPoint(x, z, brushId, LayerKind.Underfog);
             yield break;
         }
 
@@ -1327,8 +1627,38 @@ namespace RoadMapper
         {
             float x = package.ReadSingle();
             float z = package.ReadSingle();
-            EraseMarkersNear(x, z);
+            EraseMarkersNear(x, z, LayerKind.Underfog);
             yield break;
+        }
+
+        private IEnumerator ServerReceiveAdminMark(long sender, ZPackage package)
+        {
+            float x = package.ReadSingle();
+            float z = package.ReadSingle();
+            int brushId = package.ReadInt();
+            if (SenderIsAdmin(sender, "admin mark"))
+                RecordMarkerPoint(x, z, brushId, LayerKind.Overfog);
+            yield break;
+        }
+
+        private IEnumerator ServerReceiveAdminErase(long sender, ZPackage package)
+        {
+            float x = package.ReadSingle();
+            float z = package.ReadSingle();
+            if (SenderIsAdmin(sender, "admin erase"))
+                EraseMarkersNear(x, z, LayerKind.Overfog);
+            yield break;
+        }
+
+        // Same check vanilla uses for kick/ban and remote commands: the peer's host name
+        // (platform id) against the server's admin list.
+        private static bool SenderIsAdmin(long sender, string what)
+        {
+            ZNetPeer peer = ZNet.instance != null ? ZNet.instance.GetPeer(sender) : null;
+            if (peer != null && peer.m_socket != null && ZNet.instance.IsAdmin(peer.m_socket.GetHostName()))
+                return true;
+            Jotunn.Logger.LogWarning($"[RoadMapper] Refused {what} from {(peer != null ? peer.m_playerName : sender.ToString())}: not an admin.");
+            return false;
         }
 
         // Flag points: client sends (x, z, radius), server answers with every point in range.
@@ -1372,6 +1702,12 @@ namespace RoadMapper
             {
                 float dx = p.x - x, dz = p.z - z;
                 if (dx * dx + dz * dz <= r2) near.Add(p);
+            }
+            // Admin points too, tagged so clients show them as admin flags.
+            foreach (MarkerPoint p in LoadPointsFromFile(GetWorldDataFilePath(LayerKind.Overfog)))
+            {
+                float dx = p.x - x, dz = p.z - z;
+                if (dx * dx + dz * dz <= r2) near.Add(new MarkerPoint { x = p.x, z = p.z, BrushId = p.BrushId + AdminIdOffset });
             }
             return near;
         }
@@ -1430,7 +1766,7 @@ namespace RoadMapper
             foreach (MarkerPoint p in points)
             {
                 // Markers this client has no icon for are skipped.
-                if (!MapMarkers.ById.TryGetValue(p.BrushId, out MarkerIcon icon))
+                if (!MapMarkers.ById.TryGetValue(BaseId(p.BrushId), out MarkerIcon icon))
                     continue;
 
                 Vector3 pos = new Vector3(p.x, GroundHeightAt(p.x, p.z), p.z);
@@ -1459,6 +1795,9 @@ namespace RoadMapper
                 return markers;
             foreach (MarkerPoint p in LoadPointsFromFile(GetWorldDataFilePath()))
                 if (p.BrushId >= MapMarkers.FirstMarkerId) markers.Add(p);
+            foreach (MarkerPoint p in LoadPointsFromFile(GetWorldDataFilePath(LayerKind.Overfog)))
+                if (p.BrushId >= MapMarkers.FirstMarkerId)
+                    markers.Add(new MarkerPoint { x = p.x, z = p.z, BrushId = p.BrushId + AdminIdOffset });
             return markers;
         }
 
@@ -1517,11 +1856,13 @@ namespace RoadMapper
         // One "x,z,brushId" per line. Same format and folder as 1.x.
         // ---------------------------------------------------------------------
 
-        public string GetWorldDataFilePath()
+        // Ordinary (underfog) points: <WorldName>.txt, as in 1.x. Admin (overfog): <WorldName>.overfog.txt.
+        public string GetWorldDataFilePath(LayerKind kind = LayerKind.Underfog)
         {
             string folder = Path.Combine(BepInEx.Paths.ConfigPath, "RoadMapper");
             Directory.CreateDirectory(folder);
-            return Path.Combine(folder, $"{ZNet.instance.GetWorldName()}.txt");
+            string suffix = kind == LayerKind.Overfog ? ".overfog" : "";
+            return Path.Combine(folder, $"{ZNet.instance.GetWorldName()}{suffix}.txt");
         }
 
         private static float Distance(MarkerPoint a, MarkerPoint b)
@@ -1565,16 +1906,16 @@ namespace RoadMapper
             File.WriteAllLines(path, lines);
         }
 
-        private void RecordMarkerPoint(float x, float z, int brushId)
+        private void RecordMarkerPoint(float x, float z, int brushId, LayerKind kind)
         {
-            Jotunn.Logger.LogDebug($"[RoadMapper] Recording paint coord: ({x:F1}, {z:F1}, {brushId})");
+            Jotunn.Logger.LogDebug($"[RoadMapper] Recording {(kind == LayerKind.Overfog ? "admin " : "")}paint coord: ({x:F1}, {z:F1}, {brushId})");
             try
             {
-                string path = GetWorldDataFilePath();
+                string path = GetWorldDataFilePath(kind);
                 string line = string.Format(CultureInfo.InvariantCulture, "{0},{1},{2}{3}", x, z, brushId, Environment.NewLine);
                 File.AppendAllText(path, line);
                 Jotunn.Logger.LogDebug($"[RoadMapper] Wrote point to {path}");
-                OnLayerStrike();
+                OnLayerStrike(kind);
                 if (brushId >= MapMarkers.FirstMarkerId)
                     BroadcastMarkerPins();
             }
@@ -1584,9 +1925,9 @@ namespace RoadMapper
             }
         }
 
-        private void EraseMarkersNear(float x, float z)
+        private void EraseMarkersNear(float x, float z, LayerKind kind)
         {
-            string path = GetWorldDataFilePath();
+            string path = GetWorldDataFilePath(kind);
             List<MarkerPoint> loaded = LoadPointsFromFile(path);
             MarkerPoint erasePos = new MarkerPoint { x = x, z = z, BrushId = 0 };
 
@@ -1611,8 +1952,8 @@ namespace RoadMapper
             }
 
             WritePointsToFile(path, kept);
-            Jotunn.Logger.LogInfo($"[RoadMapper] Eraser removed {removedCount} marker(s) near ({x:F1}, {z:F1}).");
-            OnLayerStrike();
+            Jotunn.Logger.LogInfo($"[RoadMapper] {(kind == LayerKind.Overfog ? "Admin eraser" : "Eraser")} removed {removedCount} marker(s) near ({x:F1}, {z:F1}).");
+            OnLayerStrike(kind);
             if (removedMarker)
                 BroadcastMarkerPins();
         }
@@ -1621,11 +1962,16 @@ namespace RoadMapper
         {
             if (!IsServer) return;
 
-            string path = GetWorldDataFilePath();
-            List<MarkerPoint> loaded = LoadPointsFromFile(path);
             // Unwritten strikes go out with the save, whatever dedup finds.
             if (_layerDirty) RequestLayerWrite("world save");
 
+            DeduplicateFile(GetWorldDataFilePath(LayerKind.Underfog));
+            DeduplicateFile(GetWorldDataFilePath(LayerKind.Overfog));
+        }
+
+        private void DeduplicateFile(string path)
+        {
+            List<MarkerPoint> loaded = LoadPointsFromFile(path);
             if (loaded.Count == 0) return;
 
             List<MarkerPoint> kept = new List<MarkerPoint>();
@@ -1644,8 +1990,18 @@ namespace RoadMapper
             }
 
             WritePointsToFile(path, kept);
-            Jotunn.Logger.LogInfo($"[RoadMapper] World save dedup: {loaded.Count} lines -> {kept.Count} after dedup.");
+            Jotunn.Logger.LogInfo($"[RoadMapper] World save dedup ({Path.GetFileName(path)}): {loaded.Count} lines -> {kept.Count} after dedup.");
         }
+    }
+
+    // Which NomapPrinter custom layer a set of points belongs to.
+    [Flags]
+    internal enum LayerKind
+    {
+        None = 0,
+        Underfog = 1,   // ordinary marks: shown only where the player has explored
+        Overfog = 2,    // admin marks: shown everywhere
+        Both = Underfog | Overfog
     }
 
     // Takes the place of the TerrainOp stripped from the marker pieces: the placed copy removes

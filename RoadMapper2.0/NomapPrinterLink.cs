@@ -1,4 +1,4 @@
-using BepInEx;
+﻿using BepInEx;
 using BepInEx.Bootstrap;
 using BepInEx.Configuration;
 using HarmonyLib;
@@ -30,7 +30,8 @@ namespace RoadMapper
 
         public static string ConfigDirectory => Path.Combine(Paths.ConfigPath, PluginGuid);
 
-        public static string LayerFileName(string mapType, string worldName) => $"{mapType}.{worldName}.underfog.png";
+        // layer: "underfog" (ordinary marks) or "overfog" (admin marks).
+        public static string LayerFileName(string mapType, string worldName, string layer = "underfog") => $"{mapType}.{worldName}.{layer}.png";
 
         private static ConfigFile Config =>
             Chainloader.PluginInfos.TryGetValue(PluginGuid, out PluginInfo info) && info.Instance != null
@@ -67,6 +68,26 @@ namespace RoadMapper
         private static PropertyInfo _underfogValueProperty;
         private static bool _underfogLookupDone;
 
+        private static object _overfogSyncedValue;
+        private static PropertyInfo _overfogValueProperty;
+        private static bool _overfogLookupDone;
+
+        // Same for the overfog layer (NomapPrinter.customLayerOverfog). Null if unavailable.
+        public static string CurrentOverfogLayer
+        {
+            get
+            {
+                if (!_overfogLookupDone)
+                {
+                    _overfogLookupDone = true;
+                    FieldInfo field = AccessTools.Field(AccessTools.TypeByName("NomapPrinter.NomapPrinter"), "customLayerOverfog");
+                    _overfogSyncedValue = field?.GetValue(null);
+                    _overfogValueProperty = _overfogSyncedValue?.GetType().GetProperty("Value");
+                }
+                return _overfogValueProperty?.GetValue(_overfogSyncedValue) as string;
+            }
+        }
+
         // Current underfog layer as NomapPrinter sees it on this machine. Null if unavailable.
         // A newly synced layer is a new string object, so callers compare by reference.
         public static string CurrentUnderfogLayer
@@ -102,7 +123,8 @@ namespace RoadMapper
         }
 
         // Returns human-readable problems with NomapPrinter's settings; empty if all good.
-        public static List<string> CheckSettings()
+        // hasOverfogPoints: only warn about the over-fog settings when there are admin marks to show.
+        public static List<string> CheckSettings(bool hasOverfogPoints = false)
         {
             List<string> problems = new List<string>();
 
@@ -117,6 +139,14 @@ namespace RoadMapper
 
             if (!(Get("Map custom layers", "Under fog - Share from server") is bool share && share))
                 problems.Add("NomapPrinter: [Map custom layers] 'Under fog - Share from server' is off. Clients will not receive the road layer.");
+
+            if (hasOverfogPoints)
+            {
+                if (!(Get("Map custom layers", "Over fog - Enable layer") is bool overEnabled && overEnabled))
+                    problems.Add("NomapPrinter: [Map custom layers] 'Over fog - Enable layer' is off. Admin marks will not be drawn on the map.");
+                if (!(Get("Map custom layers", "Over fog - Share from server") is bool overShare && overShare))
+                    problems.Add("NomapPrinter: [Map custom layers] 'Over fog - Share from server' is off. Clients will not receive the admin layer.");
+            }
 
             if (MapType == "Vanilla")
                 problems.Add("NomapPrinter: [Map style] 'Map type' is Vanilla, which ignores custom layers. Use BirdsEye, Topographical, Chart or OldChart.");

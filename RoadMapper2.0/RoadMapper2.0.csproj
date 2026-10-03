@@ -92,6 +92,12 @@
     <None Include="Markers\*.png" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 
+  <!-- Icons/Markers are copied with PreserveNewest, which never deletes. Clear the output copies first
+       so an icon removed from the project stops shipping. -->
+  <Target Name="ClearStaleIconOutput" BeforeTargets="_CopyOutOfDateSourceItemsToOutputDirectory">
+    <RemoveDir Directories="$(OutDir)Markers;$(OutDir)Icons" />
+  </Target>
+
   <PropertyGroup>
     <VALHEIM_MANAGED>$(VALHEIM_INSTALL)/valheim_Data/Managed</VALHEIM_MANAGED>
     <UNITY_FOLDER>$(SolutionDir)JotunnModStubUnity</UNITY_FOLDER>

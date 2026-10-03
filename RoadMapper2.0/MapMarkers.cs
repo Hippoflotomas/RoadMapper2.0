@@ -33,6 +33,11 @@ namespace RoadMapper
     {
         public const int FirstMarkerId = 50;
 
+        // Ids that shipped in an earlier release and were removed (2.1.0: 51 Hut, 59 Observatory,
+        // 60 Tavern, 61 Shop, 66 Treasure). Never reuse them: worlds may still hold markers with these
+        // ids, and a reused id would silently turn those into a different icon. New icons take the
+        // next free id after the highest one ever used (74 as of 2.2.0).
+
         // Icons are stamped at their own size (one PNG pixel = one map pixel, 6 m at default map
         // size). This stops one oversized PNG painting over half a biome.
         public const int MaxIconSize = 64;

@@ -53,6 +53,8 @@ if ($Target.Equals("Debug")) {
     Copy-Item -Path "$TargetPath\$name.pdb" -Destination "$plug" -Force
     Copy-Item -Path "$TargetPath\$name.dll.mdb" -Destination "$plug" -Force
     if (Test-Path "$TargetPath\Icons") { Copy-Item -Path "$TargetPath\Icons" -Destination "$plug" -Recurse -Force }
+    # Replace, not merge: a marker removed from the project must not linger in the deployed folder.
+    if (Test-Path "$plug\Markers") { Remove-Item -Path "$plug\Markers" -Recurse -Force }
     if (Test-Path "$TargetPath\Markers") { Copy-Item -Path "$TargetPath\Markers" -Destination "$plug" -Recurse -Force }
 }
 
@@ -65,6 +67,7 @@ if($Target.Equals("Release")) {
     New-Item -Type Directory -Path "$PackagePath\plugins" -Force
     Copy-Item -Path "$TargetPath\$TargetAssembly" -Destination "$PackagePath\plugins\$TargetAssembly" -Force
     if (Test-Path "$TargetPath\Icons") { Copy-Item -Path "$TargetPath\Icons" -Destination "$PackagePath\plugins" -Recurse -Force }
+    if (Test-Path "$PackagePath\plugins\Markers") { Remove-Item -Path "$PackagePath\plugins\Markers" -Recurse -Force }
     if (Test-Path "$TargetPath\Markers") { Copy-Item -Path "$TargetPath\Markers" -Destination "$PackagePath\plugins" -Recurse -Force }
     Copy-Item -Path "$ProjectPath\README.md" -Destination "$PackagePath\README.md" -Force
     Compress-Archive -Path "$PackagePath\*" -DestinationPath "$TargetPath\$name.zip" -Force

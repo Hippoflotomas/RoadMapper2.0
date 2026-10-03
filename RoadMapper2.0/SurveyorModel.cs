@@ -73,6 +73,15 @@ namespace RoadMapper
                     return;
                 }
 
+                // Carried, not planted: one LOD level, and the wisp's mist particles move with the
+                // hand instead of trailing behind in world space as the player walks.
+                MarkerBanner.CollapseLods(wisp);
+                foreach (ParticleSystem ps in bundle.GetComponentsInChildren<ParticleSystem>(true))
+                {
+                    ParticleSystem.MainModule main = ps.main;
+                    main.simulationSpace = ParticleSystemSimulationSpace.Local;
+                }
+
                 // Both stakes to height 1, standing on y = 0, their POLES on the grip line (not the
                 // middle of their shapes: the banner's cloth sticks out sideways, and centring on it
                 // pushed the pole out the back of the hand). Then a pole's width apart, leaning apart.
