@@ -1,7 +1,7 @@
-{
+﻿{
   "name": "RoadMapper",
-  "description": "Mark roads, walls and places with the Surveyor tool and see them on NomapPrinter's printed map. Map markers show as banners in the world and as pins for compass mods.",
-  "version_number": "2.1.0",
+  "description": "Mark roads, walls and places with the Surveyor tool and see them on NomapPrinter's printed map. Markers show as banners and compass pins. Admins can add marks everyone sees.",
+  "version_number": "2.2.0",
   "website_url": "",
   "dependencies": [
     "denikson-BepInExPack_Valheim-5.4.2333",
