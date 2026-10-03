@@ -10,7 +10,7 @@ Mark roads, walls, fences and places while you walk, and have them drawn onto [N
 - **See your work**: while you hold the Surveyor, every recorded road point near you shows as a small wisp torch tinted to its brush colour, and every map marker as a banner on a pole. Only you see them, and they vanish when you put the tool away.
 - **Compass friendly**: map markers are also added as (unsaved) vanilla map pins, so compass mods that read map pins show them.
 - **Death pins clean themselves up**: when your gravestone is gone (you emptied it, or someone else looted it), its death pin is removed the next time you're near it. Handy in nomap, where vanilla death pins are hard to remove and compass mods show every one.
-- **Admin marks for everyone**: admins get extra pieces (gold-framed icons, at the end of each tab): admin versions of every road brush and marker, plus an Admin Mark Eraser. These are drawn on NomapPrinter's *over*-fog layer, so every player sees them, explored or not: handy for marking the main settlement and highways for new players. Everyone holding the Surveyor sees admin marks (iron torches and full-size banners) so it's clear they're the server's. The ordinary eraser can't remove them, and the server refuses admin marks and erases from anyone not on its admin list.
+- **Admin marks for everyone**: admins get extra pieces (gold-framed icons, at the end of each tab): admin versions of every road brush and marker, plus an Admin Mark Eraser. These are drawn on NomapPrinter's *over*-fog layer, so every player sees them, explored or not: handy for marking the main settlement and highways for new players. Everyone holding the Surveyor sees admin marks (a trio of splayed wisps around an iron torch, and gold banners) so it's clear they're the server's. The ordinary eraser can't remove them, and the server refuses admin marks and erases from anyone not on its admin list.
 - **Server-driven**: the map layer is drawn by the server and synced to everyone by NomapPrinter. Reading a map table gets you the latest roads straight away.
 
 ## Requirements
@@ -42,10 +42,12 @@ Markers are 16x16 (up to 64x64) PNGs named `<id>_<name>.png`, ids from 50 up, e.
 
 ## Changelog
 
-### 2.2.0 (unreleased)
-- Map marker set reworked: added Entrance, Pin, Small Pin, Mine, Lumber, Bridge, Harbour and Longship; removed Hut, Observatory, Tavern, Shop and Treasure. Markers already placed with a removed icon are no longer drawn on the map.
+### 2.2.0
+- Admin marks: admin-only road brushes, markers and eraser that draw on NomapPrinter's over-fog layer, so everyone sees them on the map, explored or not. Shown in the world as a trio of wisps around an iron torch, and gold banners. Stored separately in `BepInEx/config/RoadMapper/<World>.overfog.txt`; the server checks every admin mark against its admin list. Needs NomapPrinter's `Over fog - Enable layer` and `Over fog - Share from server` (both off by default).
 - Death pins are removed once their gravestone is gone (config: Pins / Remove death pins).
-- Admin marks: admin-only road brushes, markers and eraser that draw on NomapPrinter's over-fog layer, so everyone sees them on the map, explored or not. Stored separately in `BepInEx/config/RoadMapper/<World>.overfog.txt`; checked server-side against the admin list.
+- Map marker set reworked: added Entrance, Pin, Small Pin, Mine, Lumber, Bridge, Harbour and Longship; removed Hut, Observatory, Tavern, Shop and Treasure. Markers already placed with a removed icon are no longer drawn on the map.
+- The Surveyor held in the hand no longer comes apart: the banner, pole and wisp stay together while you walk.
+- Marker banners now hang flush against their pole.
 
 ### 2.1.0
 - New tool, the Surveyor, with Roads and Map Markers tabs. The marker pieces no longer live on the hoe and no longer flatten the ground.
